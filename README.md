@@ -1,5 +1,6 @@
 # RCPC: Rubric-Conditioned Path Causal Credit
 
+RCPC 是一个面向 reasoning 训练的细粒度 credit assignment 方法草案。它从 ROPD/GRPO 的 rubric-level reward 出发，把原本只作用在整条 response 上的 reward 拆解到 reasoning action、局部 reasoning block，进一步探索 token/span 级 causal credit。
 
 当前仓库包含两部分：
 
@@ -19,24 +20,24 @@ RCPC 的核心目标是：在不额外训练第三个 reward/causal model 的前
 
 ## 2. Problem Setup
 
-对每个 prompt \(x_i\)，policy model 采样一组 responses：
+对每个 prompt $x_i$，policy model 采样一组 responses：
 
-\[
+$$
 y_{i,1}, y_{i,2}, ..., y_{i,G}
-\]
+$$
 
 ROPD-style pipeline 产生：
 
-- Teacher response \(y_i^T\)：高质量参考 reasoning。
-- Rubrics \(C_i = \{c_{i,1}, ..., c_{i,K}\}\)：由 Rubricator 根据 prompt、teacher response、student responses 动态生成。
-- Verifier scores \(s_{i,g,k}\)：第 \(g\) 条 student response 在第 \(k\) 条 criterion 上的得分。
-- Final scalar score \(S_{i,g}\)：通常是 criterion 加权求和并归一化后的 response-level reward。
+- Teacher response $y_i^T$：高质量参考 reasoning。
+- Rubrics $C_i = \{c_{i,1}, ..., c_{i,K}\}$：由 Rubricator 根据 prompt、teacher response、student responses 动态生成。
+- Verifier scores $s_{i,g,k}$：第 $g$ 条 student response 在第 $k$ 条 criterion 上的得分。
+- Final scalar score $S_{i,g}$：通常是 criterion 加权求和并归一化后的 response-level reward。
 
-标准 GRPO 通常只使用 \(S_{i,g}\) 做组内 advantage。RCPC 希望保留并利用更丰富的结构：
+标准 GRPO 通常只使用 $S_{i,g}$ 做组内 advantage。RCPC 希望保留并利用更丰富的结构：
 
-\[
+$$
 \{s_{i,g,k}\}_{k=1}^{K}
-\]
+$$
 
 即每条 response 在每个 rubric criterion 上的表现。
 
@@ -55,17 +56,17 @@ RCPC 可以拆成六个阶段。
 
 与普通 ROPD 不同，RCPC 不急于把所有 criterion 分数压成单一 reward，而是保留：
 
-\[
+$$
 s_{i,g,k}
-\]
+$$
 
 并计算 criterion-wise advantage：
 
-\[
+$$
 A_{i,g,k} =
 \frac{s_{i,g,k} - \mathrm{mean}_{g'}(s_{i,g',k})}
 {\mathrm{std}_{g'}(s_{i,g',k})+\epsilon}
-\]
+$$
 
 这一步能区分“这条 response 是在哪个 rubric 维度上更好或更差”。
 
@@ -73,9 +74,9 @@ A_{i,g,k} =
 
 我们把 response 切分为 micro-sentence action：
 
-\[
+$$
 y_{i,g} = (a_{i,g,1}, a_{i,g,2}, ..., a_{i,g,M})
-\]
+$$
 
 当前实现采用轻量规则：
 
@@ -84,37 +85,37 @@ y_{i,g} = (a_{i,g,1}, a_{i,g,2}, ..., a_{i,g,M})
 - reasoning connectives 作为辅助边界，例如 therefore、however、so、if、then、because、but、thus、hence、next、check、finally。
 - 设置最小字符长度、最大字符长度、最大 token 长度，避免过碎或过长。
 
-对每个 generated token \(t\)，从模型 generation logits 计算 entropy：
+对每个 generated token $t$，从模型 generation logits 计算 entropy：
 
-\[
+$$
 H_t = -\sum_v p(v|x,y_{<t})\log p(v|x,y_{<t})
-\]
+$$
 
-对 action \(a_m\) 内 token 集合 \(T_m\)，用长度自适应 top-r mean 聚合：
+对 action $a_m$ 内 token 集合 $T_m$，用长度自适应 top-r mean 聚合：
 
-\[
+$$
 E_m =
 \frac{1}{\lceil \sqrt{|T_m|} \rceil}
 \sum_{t \in \mathrm{TopR}(T_m,\lceil \sqrt{|T_m|} \rceil)} H_t
-\]
+$$
 
 这比 max 更抗噪声，也比 mean 更不容易被长 span 稀释。
 
 然后在同一条 response 内做 robust normalization：
 
-\[
+$$
 \tilde{E}_m =
 \frac{E_m - \mathrm{median}(E)}
 {\mathrm{MAD}(E)+\epsilon}
-\]
+$$
 
 当前脚本会在 MAD 太小时 fallback 到 standard deviation，避免数值爆炸。
 
 最终选择 Top-K action 作为 candidate reasoning decisions：
 
-\[
+$$
 \mathcal{A}^{cand}_{i,g} = \mathrm{TopK}_m(\tilde{E}_m)
-\]
+$$
 
 直觉：高 entropy action 往往对应模型局部不确定、路径分叉、证据选择、条件判断、结论跳转等位置。这些位置更可能是值得做 causal credit 的候选点。
 
@@ -122,19 +123,19 @@ E_m =
 
 单个 micro-action 有时语义不完整，例如一个条件判断需要左右相邻句共同构成一个 reasoning unit。因此 RCPC 不只看单点 action，也构造局部 block：
 
-\[
+$$
 b_{i,g,m:n} = (a_{i,g,m}, ..., a_{i,g,n})
-\]
+$$
 
 当前 probe 采用严格的 peak-centered 规则：
 
 1. Anchor action 必须在 Stage B 的 Top-K candidate set 中。
 2. Anchor 必须是局部 entropy peak：
 
-\[
+$$
 \tilde{E}_m \geq \tilde{E}_{m-1}, \quad
 \tilde{E}_m > \tilde{E}_{m+1}
-\]
+$$
 
 3. 只允许合并 anchor 的一阶左右邻居。
 4. 左右邻居也必须在 Stage B 的 Top-K candidate set 中，才允许进入 block。
@@ -144,7 +145,7 @@ b_{i,g,m:n} = (a_{i,g,m}, ..., a_{i,g,n})
 
 ### Stage D: Local Causal Intervention
 
-候选 action/block 只是 suspicious set，还不是 causal attribution。下一步要估计某个 action/block 对 rubric criterion \(c_k\) 的局部因果效应。
+候选 action/block 只是 suspicious set，还不是 causal attribution。下一步要估计某个 action/block 对 rubric criterion $c_k$ 的局部因果效应。
 
 可定义 intervention operator：
 
@@ -153,21 +154,21 @@ b_{i,g,m:n} = (a_{i,g,m}, ..., a_{i,g,n})
 - Counterfactual correction：把疑似错误 span 改写成更符合 rubric 的版本。
 - Counterfactual corruption：把疑似正确 span 改写成错误或不完整版本。
 
-对 action/block \(z\)，估计其对 criterion \(k\) 的 causal effect：
+对 action/block $z$，估计其对 criterion $k$ 的 causal effect：
 
-\[
+$$
 \Delta_{z,k}
 = V_k(y) - V_k(\mathrm{do}(y \setminus z))
-\]
+$$
 
 或
 
-\[
+$$
 \Delta_{z,k}
 = V_k(\mathrm{do}(y \leftarrow z^{corrected})) - V_k(y)
-\]
+$$
 
-其中 \(V_k\) 是 verifier 对 criterion \(k\) 的评分函数。
+其中 $V_k$ 是 verifier 对 criterion $k$ 的评分函数。
 
 重点是：干预发生在同一条 response 的局部 span 上，因此比跨样本相关性更接近 causal credit。
 
@@ -186,11 +187,11 @@ LLM/verifier 的 span attribution 可能不完全精准。RCPC 可以用 policy 
 
 一个简单的 gate 可以写成：
 
-\[
+$$
 G_{z,k} = \sigma(f(h_z, h_{answer}, e_k, \tilde{E}_z, \Delta_{z,k}))
-\]
+$$
 
-但为了避免引入第三个模型，早期版本不训练 \(f\)，而是使用规则或无参组合：
+但为了避免引入第三个模型，早期版本不训练 $f$，而是使用规则或无参组合：
 
 - causal effect 足够大；
 - span entropy 足够高；
@@ -199,20 +200,20 @@ G_{z,k} = \sigma(f(h_z, h_{answer}, e_k, \tilde{E}_z, \Delta_{z,k}))
 
 最终 credit：
 
-\[
+$$
 Credit_{z,k} = G_{z,k} \cdot \Delta_{z,k}
-\]
+$$
 
 ### Stage F: RCPC Advantage for Policy Optimization
 
 把 criterion-wise advantage 与 action/block causal credit 结合：
 
-\[
+$$
 A^{RCPC}_{i,g,z}
 = \sum_k A_{i,g,k} \cdot w_{z,k}
-\]
+$$
 
-其中 \(w_{z,k}\) 来自 causal effect 或 gated causal credit。
+其中 $w_{z,k}$ 来自 causal effect 或 gated causal credit。
 
 训练时可以有两种接入方式：
 
@@ -221,19 +222,19 @@ A^{RCPC}_{i,g,z}
 
 概念上，原 GRPO：
 
-\[
+$$
 \mathcal{L}_{GRPO}
 = - \sum_t A_{i,g}\log \pi_\theta(y_t|x,y_{<t})
-\]
+$$
 
 RCPC 变为：
 
-\[
+$$
 \mathcal{L}_{RCPC}
 = - \sum_t A_{i,g,t}^{RCPC}\log \pi_\theta(y_t|x,y_{<t})
-\]
+$$
 
-其中 \(A_{i,g,t}^{RCPC}\) 由包含 token \(t\) 的 action/block credit 聚合得到。
+其中 $A_{i,g,t}^{RCPC}$ 由包含 token $t$ 的 action/block credit 聚合得到。
 
 ## 4. Why Causal, Not Only Correlational
 
