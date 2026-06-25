@@ -1,6 +1,5 @@
 # RCPC: Rubric-Conditioned Path Causal Credit
 
-RCPC 是一个面向 reasoning 训练的细粒度 credit assignment 方法草案。它从 ROPD/GRPO 的 rubric-level reward 出发，把原本只作用在整条 response 上的 reward 拆解到 reasoning action、局部 reasoning block，进一步探索 token/span 级 causal credit。
 
 当前仓库包含两部分：
 
