@@ -5,6 +5,7 @@
 
 1. 方法归纳：完整描述 RCPC 的问题定义、rubric reward、候选 action 锚定、局部区间合并、因果干预、hidden-state mediation gate，以及如何接入 GRPO/ROPD。
 2. 实验脚本：用 Qwen3/Qwen 系列模型在任意 JSONL/CSV 数据集上生成 reasoning trace，提取 token entropy，锚定 Top-K candidate actions，并做 peak-centered local block aggregation。
+目前在Qwen3-0.6B上开展的数据小批量实验可见 examples/smoke_qwen3_0_6b_hard_fixed/hard_reasoning_anchor_block_review.md
 
 ## 1. Motivation
 
@@ -78,7 +79,7 @@ y_{i,g} = (a_{i,g,1}, a_{i,g,2}, ..., a_{i,g,M})
 $$
 
 当前实现采用轻量规则：
-
+(此处可能需要我们在实验中进行不断的细化修正）
 - 逗号、中文逗号作为主要边界。
 - 换行、分号、句号、列表项作为辅助边界。
 - reasoning connectives 作为辅助边界，例如 therefore、however、so、if、then、because、but、thus、hence、next、check、finally。
