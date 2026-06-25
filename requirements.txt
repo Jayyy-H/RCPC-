@@ -1,0 +1,6 @@
+torch
+transformers>=4.49.0
+datasets
+tqdm
+sentencepiece
+accelerate
