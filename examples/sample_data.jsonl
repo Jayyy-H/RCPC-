@@ -1,0 +1,2 @@
+{"id": "sample-001", "source": "toy-logic", "question": "All controlled brands require authorization. The seller lists a genuine controlled-brand product but provides no authorization. Should the listing be rejected? Answer Yes or No.", "answer": "Yes"}
+{"id": "sample-002", "source": "toy-commonsense", "question": "A person wants to keep ice cream frozen during a trip. Should they put it in an oven or a cooler? Explain briefly and give the final answer.", "answer": "cooler"}
