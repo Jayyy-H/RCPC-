@@ -72,7 +72,7 @@ $$
 
 ### Stage B: Candidate Reasoning Action Anchoring
 
-我们把 response 切分为 micro-sentence action：
+我们把 response 切分为 micro-sentence action:
 
 $$
 y_{i,g} = (a_{i,g,1}, a_{i,g,2}, ..., a_{i,g,M})
