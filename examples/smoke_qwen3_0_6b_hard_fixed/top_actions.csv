@@ -1,0 +1,15 @@
+sample_id,source,rank,action_index,text,char_start,char_end,token_count,entropy_topr_mean,entropy_robust_z,token_indices
+aime24-76,AIME24,1,9,Let me confirm.,428,443,4,0.8967714905738831,1.3096709694410529,"[119, 120, 121, 122]"
+aime24-76,AIME24,2,11,"r = (a + b - c)/2 * something? No,",459,493,15,0.8254696726799011,1.035883521172177,"[125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139]"
+aime24-76,AIME24,3,12,"maybe I should recall the formula for inradius in terms of area and semiperimeter. Yes, r = Δ/s",494,589,24,0.8067795515060425,0.9641164788278229,"[140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163]"
+aime24-76,AIME24,4,15,the formula for the circumradius is R = abc/(4,645,691,12,0.7345949113368988,0.68693913581109,"[180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191]"
+aime24-76,AIME24,5,6,6. The formula for the inradius is r = 4R sin(A/2) sin(B/,337,394,22,0.7127774655818939,0.6031636728924711,"[84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105]"
+aime24-76,AIME24,6,1,"so I need to find AB multiplied by AC in triangle ABC where the circumradius is 13, inradius is",14,109,24,0.5857444822788238,0.11537756348016374,"[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]"
+aime24-76,AIME24,7,10,"Alternatively,",444,458,2,0.5794047117233276,0.09103386994937156,"[123, 124]"
+aime24-76,AIME24,8,2,"6, and the incenter I is such that IA is perpendicular to OI. Hmm, okay.",109,182,22,0.5653791844844818,0.03717811385828695,"[28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49]"
+aime24-76,AIME24,9,3,"Let me start by recalling some formulas related to triangle centers and their relationships.
+
+First,",183,283,17,0.5460147678852081,-0.03717811385828695,"[50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66]"
+aime24-76,AIME24,10,4,the circumradius R is given as 1,284,316,9,0.5207699139912924,-0.13411426967710166,"[67, 68, 69, 70, 71, 72, 73, 74, 75]"
+aime24-76,AIME24,11,5,3. The inradius r is,316,336,7,0.214463472366333,-1.3102814631350859,"[76, 77, 78, 79, 80, 81, 82]"
+aime24-76,AIME24,12,7,"2) sin(C/2). Wait,",394,412,9,0.2035671273867289,-1.3521216654684822,"[106, 107, 108, 109, 110, 111, 112, 113, 114]"
