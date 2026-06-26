@@ -1,0 +1,85 @@
+data:
+  train_files: /mnt/bn/chenhaobo-va-data/lrj/data/flywheel_runs/test/final_clean.jsonl
+  val_files: /mnt/bn/chenhaobo-va-data/lrj/data/train_ropd/cot_6k_train.jsonl
+  prompt_key: problem
+  target_key: solution
+  max_prompt_length: 4096
+  max_response_length: 1024
+  rollout_batch_size: 32
+  shuffle: true
+  seed: 1
+  max_pixels: 200704
+  min_pixels: 78400
+
+algorithm:
+  adv_estimator: grpo
+  kl_coef: 0.0
+  rl_paradigm: sft+rl
+
+worker:
+  actor:
+    global_batch_size: 32
+    micro_batch_size_per_device_for_update: 1
+    micro_batch_size_per_device_for_experience: 4
+    max_grad_norm: 1.0
+    use_kl_loss: false
+    kl_loss_coef: 0
+    kl_loss_type: low_var_kl
+    sft_coef: 1
+    sft_coef_decay_step: 60
+    sft_coef_decay_rate: 0.1
+    model:
+      model_path: /mnt/bn/chenhaobo-va-data/lrj/checkpoints/valleylite-7b-ipr-cot-sft-0524/final/
+      enable_gradient_checkpointing: true
+      trust_remote_code: false
+      attn_implementation: sdpa
+    optim:
+      lr: 5.0e-6
+      weight_decay: 1.0e-2
+    fsdp:
+      enable_full_shard: false
+      param_offload: false
+      optimizer_offload: true
+      torch_dtype: bf16
+    offload:
+      param_offload: true
+      optimizer_offload: true
+
+  rollout:
+    name: "vllm"
+    temperature: 1.0
+    seed: 0
+    forced_response_prefix: "<think>\n"
+    tensor_parallel_size: 2
+    gpu_memory_utilization: 0.6
+    n: 8
+    limit_images: 16
+    max_image_num: 16
+    mm_processor_cache_gb: 0
+    enable_chunked_prefill: false
+    max_num_batched_tokens: 8192
+
+  ref:
+    offload:
+      param_offload: true
+
+  reward:
+    reward_type: function
+    compute_score: ipr
+
+trainer:
+  total_episodes: 40
+  logger: ["console", "wandb"]
+  project_name: auditgpt_grpo
+  experiment_name: valleylite-7b-GRPO
+  n_gpus_per_node: 8
+  nnodes: 1
+  save_freq: 10
+  test_freq: 10
+  val_before_train: true
+  val_only: false
+  save_checkpoint_path: /mnt/bn/chenhaobo-va-data/lrj/ecom-test/ecom-test/checkpoints/valleylite-GRPO-v1/
+  load_checkpoint_path: null
+  save_ckpt_limit: 10
+  save_shard_limit: 10
+  val_generations_to_log_to_wandb: 10

@@ -1,0 +1,80 @@
+data:
+  train_files: /mnt/bn/fengshuyang-bytenas-10t/jiangzishang/mllm/data_flywheel/result/grpo_data/train_clean.jsonl
+  val_files: /mnt/bn/fengshuyang-bytenas-10t/jiangzishang/mllm/data_flywheel/result/grpo_data/test_clean.jsonl
+  prompt_key: problem
+  target_key: solution
+  max_prompt_length: 4096
+  max_response_length: 1024
+  rollout_batch_size: 64
+  shuffle: true
+  seed: 1
+  max_pixels: 200704
+  min_pixels: 78400
+algorithm:
+  adv_estimator: grpo
+  kl_coef: 0.0
+  rl_paradigm: sft+rl
+
+worker:
+  actor:
+    global_batch_size: 64
+    micro_batch_size_per_device_for_update: 1
+    micro_batch_size_per_device_for_experience: 4
+    max_grad_norm: 1.0
+    use_kl_loss: false
+    kl_loss_coef: 0
+    kl_loss_type: low_var_kl
+    sft_coef: 1
+    sft_coef_decay_step: 250
+    sft_coef_decay_rate: 0.1
+    model:
+      model_path: /mnt/bn/yangmin-priv/czh/models/Valley_B7_v3_navit_cot_AutoModel_clean/
+      enable_gradient_checkpointing: true
+      trust_remote_code: true
+    optim:
+      lr: 5.0e-6
+      weight_decay: 1.0e-2
+    fsdp:
+      enable_full_shard: false
+      param_offload: false
+      optimizer_offload: true
+      torch_dtype: bf16
+    offload:
+      param_offload: true
+      optimizer_offload: true
+
+  rollout:
+    name: "vllm_valley"
+    temperature: 1.0
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.6
+    n: 8
+    enable_chunked_prefill: false
+    max_num_batched_tokens: 20000
+
+  ref:
+    offload:
+      param_offload: true
+  
+  reward:
+    reward_type: function
+    compute_score: ipr
+  # reward:
+  #   reward_type: batch
+  #   compute_score: /mnt/bn/fengshuyang-bytenas-10t/jiangzishang/mllm/EasyR1/examples/reward_function/ipr.py:compute_score
+
+trainer:
+  total_episodes: 40
+  logger: ["console", "wandb"]
+  project_name: ipr-audigpt
+  experiment_name: valley_b7v4-GRPO
+  n_gpus_per_node: 4
+  nnodes: 1
+  save_freq: 10
+  test_freq: 10
+  val_before_train: true
+  val_only: false
+  save_checkpoint_path: null
+  save_ckpt_limit: 3
+  save_shard_limit: 3
+  val_generations_to_log_to_wandb: 10

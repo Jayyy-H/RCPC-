@@ -1,0 +1,344 @@
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 51, in <module>
+    time.sleep(sleep_time)
+KeyboardInterrupt
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 51, in <module>
+    time.sleep(sleep_time)
+KeyboardInterrupt
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 51, in <module>
+    time.sleep(sleep_time)
+KeyboardInterrupt
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 50, in <module>
+    if sleep_time > 0 and cnt > sleep_step:
+KeyboardInterrupt
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 50, in <module>
+    if sleep_time > 0 and cnt > sleep_step:
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 50, in <module>
+    if sleep_time > 0 and cnt > sleep_step:
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 19, in <module>
+    N = torch.cuda.device_count()
+  File "/mnt/bn/chobits-wx-137-fuse/czh/env/miniconda3/envs/easyr1_stable/lib/python3.10/site-packages/torch/cuda/__init__.py", line 904, in device_count
+    nvml_count = _device_count_amdsmi() if torch.version.hip else _device_count_nvml()
+  File "/mnt/bn/chobits-wx-137-fuse/czh/env/miniconda3/envs/easyr1_stable/lib/python3.10/site-packages/torch/cuda/__init__.py", line 860, in _device_count_nvml
+    raw_cnt = _raw_device_count_nvml()
+  File "/mnt/bn/chobits-wx-137-fuse/czh/env/miniconda3/envs/easyr1_stable/lib/python3.10/site-packages/torch/cuda/__init__.py", line 714, in _raw_device_count_nvml
+    rc = nvml_h.nvmlInit()
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 51, in <module>
+    time.sleep(sleep_time)
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 50, in <module>
+    if sleep_time > 0 and cnt > sleep_step:
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 50, in <module>
+    if sleep_time > 0 and cnt > sleep_step:
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 50, in <module>
+    if sleep_time > 0 and cnt > sleep_step:
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 50, in <module>
+    if sleep_time > 0 and cnt > sleep_step:
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 50, in <module>
+    if sleep_time > 0 and cnt > sleep_step:
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 51, in <module>
+    time.sleep(sleep_time)
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 51, in <module>
+    time.sleep(sleep_time)
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 51, in <module>
+    time.sleep(sleep_time)
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 51, in <module>
+    time.sleep(sleep_time)
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 51, in <module>
+    time.sleep(sleep_time)
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 50, in <module>
+    if sleep_time > 0 and cnt > sleep_step:
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 50, in <module>
+    if sleep_time > 0 and cnt > sleep_step:
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 51, in <module>
+    time.sleep(sleep_time)
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 51, in <module>
+    time.sleep(sleep_time)
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 51, in <module>
+    time.sleep(sleep_time)
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 50, in <module>
+    if sleep_time > 0 and cnt > sleep_step:
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 50, in <module>
+    if sleep_time > 0 and cnt > sleep_step:
+KeyboardInterrupt
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 50, in <module>
+    if sleep_time > 0 and cnt > sleep_step:
+KeyboardInterrupt
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 50, in <module>
+    if sleep_time > 0 and cnt > sleep_step:
+KeyboardInterrupt
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 51, in <module>
+    time.sleep(sleep_time)
+KeyboardInterrupt
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 50, in <module>
+    if sleep_time > 0 and cnt > sleep_step:
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 51, in <module>
+    time.sleep(sleep_time)
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 1, in <module>
+    import torch
+  File "/mnt/bn/chobits-wx-137-fuse/czh/env/miniconda3/envs/easyr1_stable/lib/python3.10/site-packages/torch/__init__.py", line 17, in <module>
+    import inspect
+  File "/mnt/bn/chobits-wx-137-fuse/czh/env/miniconda3/envs/easyr1_stable/lib/python3.10/inspect.py", line 37, in <module>
+    import ast
+  File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1006, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 688, in _load_unlocked
+  File "<frozen importlib._bootstrap_external>", line 879, in exec_module
+  File "<frozen importlib._bootstrap_external>", line 975, in get_code
+  File "<frozen importlib._bootstrap_external>", line 1074, in get_data
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([1342177280])
+Allocated tensor on cuda:1 with shape torch.Size([1342177280])
+Allocated tensor on cuda:2 with shape torch.Size([1342177280])
+Allocated tensor on cuda:3 with shape torch.Size([1342177280])
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 40, in <module>
+    a[i] = torch.rand(elements_per_gpu, dtype=torch.float32, device=f'cuda:{i}')
+RuntimeError: CUDA error: invalid device ordinal
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+Allocated tensor on cuda:0 with shape torch.Size([671088640])
+Allocated tensor on cuda:1 with shape torch.Size([671088640])
+Allocated tensor on cuda:2 with shape torch.Size([671088640])
+Allocated tensor on cuda:3 with shape torch.Size([671088640])
+Allocated tensor on cuda:4 with shape torch.Size([671088640])
+Allocated tensor on cuda:5 with shape torch.Size([671088640])
+Allocated tensor on cuda:6 with shape torch.Size([671088640])
+Allocated tensor on cuda:7 with shape torch.Size([671088640])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 51, in <module>
+    time.sleep(sleep_time)
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([671088640])
+Allocated tensor on cuda:1 with shape torch.Size([671088640])
+Allocated tensor on cuda:2 with shape torch.Size([671088640])
+Allocated tensor on cuda:3 with shape torch.Size([671088640])
+Allocated tensor on cuda:4 with shape torch.Size([671088640])
+Allocated tensor on cuda:5 with shape torch.Size([671088640])
+Allocated tensor on cuda:6 with shape torch.Size([671088640])
+Allocated tensor on cuda:7 with shape torch.Size([671088640])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 50, in <module>
+    if sleep_time > 0 and cnt > sleep_step:
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([671088640])
+Allocated tensor on cuda:1 with shape torch.Size([671088640])
+Allocated tensor on cuda:2 with shape torch.Size([671088640])
+Allocated tensor on cuda:3 with shape torch.Size([671088640])
+Allocated tensor on cuda:4 with shape torch.Size([671088640])
+Allocated tensor on cuda:5 with shape torch.Size([671088640])
+Allocated tensor on cuda:6 with shape torch.Size([671088640])
+Allocated tensor on cuda:7 with shape torch.Size([671088640])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 51, in <module>
+    time.sleep(sleep_time)
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([671088640])
+Allocated tensor on cuda:1 with shape torch.Size([671088640])
+Allocated tensor on cuda:2 with shape torch.Size([671088640])
+Allocated tensor on cuda:3 with shape torch.Size([671088640])
+Allocated tensor on cuda:4 with shape torch.Size([671088640])
+Allocated tensor on cuda:5 with shape torch.Size([671088640])
+Allocated tensor on cuda:6 with shape torch.Size([671088640])
+Allocated tensor on cuda:7 with shape torch.Size([671088640])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 51, in <module>
+    time.sleep(sleep_time)
+KeyboardInterrupt
+Allocated tensor on cuda:0 with shape torch.Size([671088640])
+Allocated tensor on cuda:1 with shape torch.Size([671088640])
+Allocated tensor on cuda:2 with shape torch.Size([671088640])
+Allocated tensor on cuda:3 with shape torch.Size([671088640])
+Allocated tensor on cuda:4 with shape torch.Size([671088640])
+Allocated tensor on cuda:5 with shape torch.Size([671088640])
+Allocated tensor on cuda:6 with shape torch.Size([671088640])
+Allocated tensor on cuda:7 with shape torch.Size([671088640])
+fuck gpu but sleep 0.1s per 50 iteration
+Traceback (most recent call last):
+  File "/mnt/bn/chenhaobo-va-data/ipr_mllm/code/IPR_MLLM/scripts/fuck_gpu.py", line 51, in <module>
+    time.sleep(sleep_time)
+KeyboardInterrupt
