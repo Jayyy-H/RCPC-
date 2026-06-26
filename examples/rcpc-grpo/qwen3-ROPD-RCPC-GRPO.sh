@@ -55,7 +55,6 @@ if [[ "${ROPD_SMOKE:-1}" == "1" ]]; then
         trainer.test_freq=-1
         data.rollout_batch_size=1
         data.val_batch_size=1
-        worker.actor.global_batch_size=1
         worker.rollout.n=2
         worker.rollout.tensor_parallel_size=1
         worker.reward.num_examine=3
