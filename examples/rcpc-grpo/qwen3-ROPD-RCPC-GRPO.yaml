@@ -80,9 +80,10 @@ worker:
     ropd_teacher_answer_count: 3
     ropd_max_concurrency: 4
     ropd_request_timeout: 120.0
+    ropd_prompt_dir: prompts/rcpc_dlr
     ropd_include_ground_truth: true
     ropd_include_images: false
-    ropd_filter_teacher_by_answer: true
+    ropd_filter_teacher_by_answer: false
     ropd_print_teacher_outputs: true
     ropd_print_student_outputs: true
     ropd_print_rubric_outputs: true
@@ -90,7 +91,7 @@ worker:
     ropd_require_strict_cot_format: true
     ropd_final_label_points_cap: 5
     ropd_format_points_cap: 1
-    ropd_fallback_to_ipr: true
+    ropd_fallback_to_ipr: false
     ropd_score_offpolicy: false
     ropd_use_criterion_advantage: true
 
