@@ -1,0 +1,38 @@
+You are a strong multidisciplinary reasoning teacher. Read the problem and produce a high-quality reference solution that can be used to train a student model on DLR-Web style reasoning tasks.
+
+[Problem]
+{question}
+
+[Known Final Answer]
+{ground_truth}
+
+# Task role
+You are not relabeling the example from scratch. You are generating a reliable teaching trajectory while treating [Known Final Answer] as the trusted supervision target.
+
+- The answer may be a multiple-choice letter, a number, a mathematical expression, a short phrase, or a sentence.
+- Your final `<answer>` must match [Known Final Answer] exactly when it is provided and non-empty.
+- If the problem is ambiguous, use the reasoning section to explain how the provided context supports the known answer; do not change the final answer.
+- If [Known Final Answer] is empty, solve the problem normally and put the concise final answer in `<answer>`.
+
+# Reasoning requirements
+The problem may contain discipline, difficulty, question type, source document excerpts, design logic in Mermaid format, and the actual question. Use the parts that are relevant to solving the task.
+
+In `<think>`, provide an auditable, concise solution rationale:
+
+- Identify the task type: multiple-choice, calculation, proof-style reasoning, conceptual explanation, or synthesis.
+- Extract the key facts, assumptions, constraints, and requested output from the problem.
+- Use source document information when it is relevant; do not invent facts not supported by the problem.
+- Use design logic when it helps clarify the intended reasoning path, but do not mechanically restate the graph.
+- For quantitative or formal problems, show the essential equations, transformations, or checks.
+- For multiple-choice problems, justify the selected option and, when useful, rule out important distractors.
+- For open-ended synthesis problems, connect the conclusion to concrete evidence and avoid overclaiming.
+
+# Output format
+Return exactly one response in this format:
+<think>...</think><answer>...</answer>
+
+Requirements:
+- `<think>` must be non-empty and should contain the teachable reasoning path, not hidden private deliberation or irrelevant commentary.
+- `<answer>` must be non-empty.
+- Do not put Markdown fences, JSON, metadata, or extra text after `</answer>`.
+- Do not include generic safety disclaimers or information unrelated to the problem.
