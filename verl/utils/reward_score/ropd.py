@@ -45,7 +45,7 @@ def _has_strict_cot_format(text: str) -> bool:
     if not _SUBSTANTIVE_RE.search(think_match.group(1).strip()):
         return False
 
-    return answer_match.group(1).strip().upper() in {"YES", "NO"}
+    return bool(_SUBSTANTIVE_RE.search(answer_match.group(1).strip()))
 
 
 def _cfg(config: Any, name: str, default: Any) -> Any:
