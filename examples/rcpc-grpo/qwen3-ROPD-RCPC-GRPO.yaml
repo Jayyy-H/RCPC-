@@ -1,0 +1,139 @@
+data:
+  # Override from shell:
+  #   TRAIN_FILE=/path/to/train.jsonl VAL_FILE=/path/to/val.jsonl bash examples/rcpc-grpo/qwen3-ROPD-RCPC-GRPO.sh
+  train_files: ""
+  val_files: ""
+  prompt_key: problem
+  target_key: solution
+  max_prompt_length: 4096
+  max_response_length: 1024
+  rollout_batch_size: 32
+  shuffle: true
+  seed: 1
+  # Text-only Qwen3 does not use these image fields. They are kept only
+  # because DataConfig has them.
+  max_pixels: 0
+  min_pixels: 0
+
+algorithm:
+  adv_estimator: grpo
+  kl_coef: 0.0
+  rl_paradigm: sft+rl
+
+worker:
+  actor:
+    global_batch_size: 32
+    micro_batch_size_per_device_for_update: 1
+    micro_batch_size_per_device_for_experience: 4
+    max_grad_norm: 1.0
+    use_kl_loss: false
+    kl_loss_coef: 0
+    kl_loss_type: low_var_kl
+    sft_coef: 1
+    sft_coef_decay_step: 40
+    sft_coef_decay_rate: 0.1
+    model:
+      model_path: ""
+      enable_gradient_checkpointing: true
+      trust_remote_code: true
+      attn_implementation: flash_attention_2
+    optim:
+      lr: 5.0e-6
+      weight_decay: 1.0e-2
+    fsdp:
+      enable_full_shard: false
+      param_offload: false
+      optimizer_offload: true
+      torch_dtype: bf16
+    offload:
+      param_offload: true
+      optimizer_offload: true
+
+  rollout:
+    name: "vllm"
+    temperature: 1.0
+    seed: 0
+    forced_response_prefix: "<think>\n"
+    tensor_parallel_size: 2
+    gpu_memory_utilization: 0.6
+    n: 8
+    # Qwen3 is text-only here. Keep all multimodal knobs disabled.
+    limit_images: 0
+    max_image_num: 0
+    mm_processor_cache_gb: -1
+    disable_mm_preprocessor_cache: true
+    enable_chunked_prefill: false
+    max_num_batched_tokens: 8192
+
+  ref:
+    offload:
+      param_offload: true
+
+  reward:
+    reward_type: function
+    compute_score: ropd_ipr
+    num_examine: 10
+    ropd_model: gpt-5.4-2026-03-05
+    ropd_api_style: responses
+    ropd_api_key_env: GPT5_4_API_KEY
+    ropd_base_url_env: GPT5_4_BASE_URL
+    ropd_teacher_answer_count: 3
+    ropd_max_concurrency: 4
+    ropd_request_timeout: 120.0
+    ropd_include_ground_truth: true
+    ropd_include_images: false
+    ropd_filter_teacher_by_answer: true
+    ropd_print_teacher_outputs: true
+    ropd_print_student_outputs: true
+    ropd_print_rubric_outputs: true
+    ropd_print_verifier_outputs: true
+    ropd_require_strict_cot_format: true
+    ropd_final_label_points_cap: 5
+    ropd_format_points_cap: 1
+    ropd_fallback_to_ipr: true
+    ropd_score_offpolicy: false
+    ropd_use_criterion_advantage: true
+
+    # RCPC: rubric-conditioned path/token credit. The causal intervention
+    # mechanism is available but bounded, because each intervened block triggers
+    # an extra verifier call.
+    ropd_rcpc_enabled: true
+    ropd_rcpc_use_token_advantage: true
+    ropd_rcpc_top_actions: 12
+    ropd_rcpc_top_blocks: 6
+    ropd_rcpc_min_action_chars: 12
+    ropd_rcpc_max_action_chars: 260
+    ropd_rcpc_max_action_tokens: 24
+    ropd_rcpc_min_robust_denom: 0.05
+    ropd_rcpc_min_anchor_z: 0.5
+    ropd_rcpc_intervention_enabled: true
+    ropd_rcpc_intervention_max_groups_per_batch: 1
+    ropd_rcpc_intervention_max_blocks_per_answer: 2
+    ropd_rcpc_intervention_mode: mask
+    ropd_rcpc_fallback_to_criterion_advantage: true
+    ropd_print_rcpc_outputs: true
+
+    # Shadow attribution remains inspection-only.
+    ropd_shadow_attribution_enabled: false
+    ropd_shadow_attribution_max_groups_per_batch: 1
+    ropd_shadow_attribution_max_output_tokens: 4096
+    ropd_print_shadow_attributions: false
+    ropd_debug_path: outputs/rcpc_reward_debug.jsonl
+
+trainer:
+  total_episodes: 40
+  logger: ["console", "wandb"]
+  project_name: rcpc-reasoning
+  experiment_name: qwen3-ROPD-RCPC-GRPO
+  n_gpus_per_node: 8
+  nnodes: 1
+  save_freq: 10
+  test_freq: 10
+  val_before_train: true
+  val_only: false
+  save_checkpoint_path: checkpoints/rcpc/qwen3-ROPD-RCPC-GRPO/
+  load_checkpoint_path: null
+  save_ckpt_limit: 20
+  save_shard_limit: 10
+  val_generations_to_log_to_wandb: 20
+  max_val_batches: 2

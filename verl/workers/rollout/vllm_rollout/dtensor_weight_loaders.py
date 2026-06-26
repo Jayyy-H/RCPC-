@@ -358,6 +358,9 @@ __MODEL_DTENSOR_WEIGHT_LOADER_REGISTRY__ = {
     "GemmaForCausalLM": gemma_dtensor_weight_loader,
     "Gemma2ForCausalLM": gemma_dtensor_weight_loader,
     "Qwen2ForCausalLM": qwen2_dtensor_weight_loader,
+    # Qwen3 text models keep the same stacked q/k/v and gate/up projection
+    # layout used by Qwen2 in vLLM, so the Qwen2 loader is the correct adapter.
+    "Qwen3ForCausalLM": qwen2_dtensor_weight_loader,
     "DeepseekV2ForCausalLM": deepseekv2_dtensor_weight_loader,
     "Qwen2VLForConditionalGeneration": qwen2vl_dtensor_weight_loader,
     "Qwen2_5_VLForConditionalGeneration": qwen2vl_dtensor_weight_loader,

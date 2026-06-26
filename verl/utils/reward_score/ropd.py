@@ -13,6 +13,12 @@ import torch
 
 from verl import DataProto
 from verl.utils.reward_score.ipr import ipr_compute_score
+from verl.utils.reward_score.rcpc import (
+    apply_intervention,
+    build_candidates,
+    build_token_advantages,
+    build_token_offsets,
+)
 
 
 RUBRIC_SCHEMA_VERSION = "ropd.rubric.v1"
@@ -399,6 +405,27 @@ class RopdIPRRewardScorer:
         self.shadow_attribution_max_groups_per_batch = max(
             0, int(_cfg(reward_config, "ropd_shadow_attribution_max_groups_per_batch", 1))
         )
+        self.rcpc_enabled = bool(_cfg(reward_config, "ropd_rcpc_enabled", False))
+        self.rcpc_use_token_advantage = bool(_cfg(reward_config, "ropd_rcpc_use_token_advantage", True))
+        self.rcpc_top_actions = max(1, int(_cfg(reward_config, "ropd_rcpc_top_actions", 12)))
+        self.rcpc_top_blocks = max(1, int(_cfg(reward_config, "ropd_rcpc_top_blocks", 6)))
+        self.rcpc_min_action_chars = max(1, int(_cfg(reward_config, "ropd_rcpc_min_action_chars", 12)))
+        self.rcpc_max_action_chars = max(1, int(_cfg(reward_config, "ropd_rcpc_max_action_chars", 260)))
+        self.rcpc_max_action_tokens = max(1, int(_cfg(reward_config, "ropd_rcpc_max_action_tokens", 24)))
+        self.rcpc_min_robust_denom = float(_cfg(reward_config, "ropd_rcpc_min_robust_denom", 0.05))
+        self.rcpc_min_anchor_z = float(_cfg(reward_config, "ropd_rcpc_min_anchor_z", 0.5))
+        self.rcpc_intervention_enabled = bool(_cfg(reward_config, "ropd_rcpc_intervention_enabled", False))
+        self.rcpc_intervention_max_groups_per_batch = max(
+            0, int(_cfg(reward_config, "ropd_rcpc_intervention_max_groups_per_batch", 1))
+        )
+        self.rcpc_intervention_max_blocks_per_answer = max(
+            0, int(_cfg(reward_config, "ropd_rcpc_intervention_max_blocks_per_answer", 2))
+        )
+        self.rcpc_intervention_mode = str(_cfg(reward_config, "ropd_rcpc_intervention_mode", "mask"))
+        self.rcpc_fallback_to_criterion_advantage = bool(
+            _cfg(reward_config, "ropd_rcpc_fallback_to_criterion_advantage", True)
+        )
+        self.print_rcpc_outputs = bool(_cfg(reward_config, "ropd_print_rcpc_outputs", False))
         self.require_strict_cot_format = bool(_cfg(reward_config, "ropd_require_strict_cot_format", True))
         self.final_label_points_cap = int(_cfg(reward_config, "ropd_final_label_points_cap", 1))
         self.format_points_cap = int(_cfg(reward_config, "ropd_format_points_cap", 1))
@@ -454,6 +481,11 @@ class RopdIPRRewardScorer:
                 group[0]["run_shadow_attribution"] = (
                     group_index < self.shadow_attribution_max_groups_per_batch
                 )
+        if self.rcpc_enabled and self.rcpc_intervention_enabled:
+            for group_index, group in enumerate(groups):
+                group[0]["run_rcpc_intervention"] = (
+                    group_index < self.rcpc_intervention_max_groups_per_batch
+                )
         if self.max_concurrency <= 1 or len(groups) <= 1:
             results = [self._score_group(group) for group in groups]
         else:
@@ -468,9 +500,18 @@ class RopdIPRRewardScorer:
         if self.use_criterion_advantage:
             criterion_advantage_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
             for result in results:
+                rcpc_token_advantages = result.get("rcpc_token_advantages", {}) if self.rcpc_enabled else {}
                 for batch_index, advantage in result.get("criterion_advantages", {}).items():
                     response_length = response_infos[batch_index]["response_length"]
-                    if response_length > 0:
+                    if response_length <= 0:
+                        continue
+                    token_values = rcpc_token_advantages.get(batch_index)
+                    if self.rcpc_enabled and self.rcpc_use_token_advantage and token_values is not None:
+                        values = torch.as_tensor(token_values[:response_length], dtype=torch.float32)
+                        if values.numel() < response_length:
+                            values = torch.nn.functional.pad(values, (0, response_length - values.numel()))
+                        criterion_advantage_tensor[batch_index, :response_length] = values[:response_length]
+                    else:
                         criterion_advantage_tensor[batch_index, :response_length] = float(advantage)
             data.batch["criterion_advantages"] = criterion_advantage_tensor
             data.meta_info["ropd_metrics"] = self._collect_criterion_metrics(results)
@@ -504,6 +545,12 @@ class RopdIPRRewardScorer:
             ),
             "criterion_advantage/std": _population_std(combined_advantages),
         }
+        rcpc_metric_values: Dict[str, List[float]] = defaultdict(list)
+        for result in results:
+            for key, value in result.get("rcpc_metrics", {}).items():
+                rcpc_metric_values[str(key)].append(float(value))
+        for key, values in rcpc_metric_values.items():
+            metrics[key] = sum(values) / len(values) if values else 0.0
         for criterion_id, values in sorted(criterion_values.items()):
             safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", criterion_id)
             judgements = values["judgements"]
@@ -519,6 +566,7 @@ class RopdIPRRewardScorer:
 
     def _collect_response_infos(self, data: DataProto) -> List[Dict[str, Any]]:
         responses = data.batch["responses"]
+        old_log_probs = data.batch.get("old_log_probs", None)
         response_width = responses.shape[-1]
         attention_mask = data.batch["attention_mask"]
         response_mask = attention_mask[:, -response_width:]
@@ -533,7 +581,14 @@ class RopdIPRRewardScorer:
         infos = []
         for batch_index in range(len(data)):
             response_length = int(valid_response_lengths[batch_index].item())
+            valid_response_ids = responses[batch_index][:response_length].detach().cpu().tolist()
             response_text = self._decode_response_text(responses[batch_index], response_length)
+            if old_log_probs is not None and response_length > 0:
+                token_uncertainties = (
+                    -old_log_probs[batch_index][:response_length].detach().float().cpu()
+                ).tolist()
+            else:
+                token_uncertainties = [0.0] * response_length
             raw_prompt = (
                 raw_prompts[batch_index]
                 if batch_index < len(raw_prompts)
@@ -549,6 +604,9 @@ class RopdIPRRewardScorer:
                     "image_paths": [str(item) for item in _as_list(image_paths) if item],
                     "ground_truth": str(answers[batch_index]) if batch_index < len(answers) else "",
                     "response_text": response_text,
+                    "response_token_ids": valid_response_ids,
+                    "response_token_offsets": build_token_offsets(self.tokenizer, valid_response_ids),
+                    "response_token_uncertainties": token_uncertainties,
                     "response_length": response_length,
                 }
             )
@@ -655,8 +713,13 @@ class RopdIPRRewardScorer:
                 "verifier_payload": verifier_payload,
                 "shadow_attribution": None,
                 "shadow_attribution_error": "",
+                "rcpc_candidates": [],
+                "rcpc_interventions": {},
+                "rcpc_token_advantages": {},
+                "rcpc_metrics": {},
                 "error": "",
             }
+            self._maybe_add_rcpc_credit(first, group, result)
             self._maybe_add_shadow_attribution(first, result)
             self._maybe_print_group(first, result)
             return result
@@ -689,10 +752,161 @@ class RopdIPRRewardScorer:
                 "rubric": rubric,
                 "shadow_attribution": None,
                 "shadow_attribution_error": "",
+                "rcpc_candidates": [],
+                "rcpc_interventions": {},
+                "rcpc_token_advantages": {},
+                "rcpc_metrics": {},
                 "error": "{}: {}".format(type(exc).__name__, exc),
             }
             self._maybe_print_group(first, result)
             return result
+
+    def _maybe_add_rcpc_credit(
+        self,
+        first: Mapping[str, Any],
+        group: Sequence[Dict[str, Any]],
+        result: Dict[str, Any],
+    ) -> None:
+        if not self.rcpc_enabled or not result.get("ok", False):
+            return
+        try:
+            candidates = [
+                self._build_rcpc_candidates_for_response(info)
+                for info in group
+            ]
+            result["rcpc_candidates"] = candidates
+            interventions = {}
+            if self.rcpc_intervention_enabled and first.get("run_rcpc_intervention", False):
+                interventions = self._run_rcpc_interventions(first, group, result, candidates)
+            result["rcpc_interventions"] = interventions
+            token_advantages, metrics = self._build_rcpc_token_advantages(group, result, candidates, interventions)
+            result["rcpc_token_advantages"] = token_advantages
+            result["rcpc_metrics"] = metrics
+        except Exception as exc:
+            result["rcpc_error"] = "{}: {}".format(type(exc).__name__, exc)
+
+    def _build_rcpc_candidates_for_response(self, info: Mapping[str, Any]) -> Dict[str, Any]:
+        token_uncertainties = list(info.get("response_token_uncertainties") or [])
+        response_length = int(info.get("response_length", 0))
+        if len(token_uncertainties) < response_length:
+            token_uncertainties.extend([0.0] * (response_length - len(token_uncertainties)))
+        return build_candidates(
+            str(info.get("response_text", "")),
+            info.get("response_token_offsets") or [],
+            token_uncertainties,
+            top_actions=self.rcpc_top_actions,
+            top_blocks=self.rcpc_top_blocks,
+            min_action_chars=self.rcpc_min_action_chars,
+            max_action_chars=self.rcpc_max_action_chars,
+            max_action_tokens=self.rcpc_max_action_tokens,
+            min_robust_denom=self.rcpc_min_robust_denom,
+            min_anchor_z=self.rcpc_min_anchor_z,
+        )
+
+    def _run_rcpc_interventions(
+        self,
+        first: Mapping[str, Any],
+        group: Sequence[Dict[str, Any]],
+        result: Mapping[str, Any],
+        candidates: Sequence[Mapping[str, Any]],
+    ) -> Dict[int, Dict[int, Dict[str, Any]]]:
+        intervention_items = []
+        for response_index, (info, candidate) in enumerate(zip(group, candidates)):
+            blocks = list(candidate.get("candidate_blocks", []))[: self.rcpc_intervention_max_blocks_per_answer]
+            for block in blocks:
+                intervention_items.append(
+                    {
+                        "response_index": response_index,
+                        "batch_index": info["batch_index"],
+                        "block_index": int(block["block_index"]),
+                        "block": block,
+                        "text": apply_intervention(
+                            str(info["response_text"]),
+                            block,
+                            mode=self.rcpc_intervention_mode,
+                        ),
+                    }
+                )
+        if not intervention_items:
+            return {}
+
+        payload = self._verify_answers(
+            dict(first),
+            result["rubric"],
+            [item["text"] for item in intervention_items],
+        )
+        original_answers = list(result["student_verifier_answers"])
+        original_format_valid = list(result.get("student_format_valid", []))
+        criterion_ids = [str(item["criterion_id"]) for item in result["rubric"]["rubrics"]]
+        restored: Dict[int, Dict[int, Dict[str, Any]]] = defaultdict(dict)
+        for item, intervened_answer in zip(intervention_items, payload["answers"]):
+            response_index = int(item["response_index"])
+            original = original_answers[response_index]
+            criterion_effects = {}
+            for criterion_index, criterion_id in enumerate(criterion_ids):
+                original_judgement = bool(original["judgement"][criterion_index])
+                if self.require_strict_cot_format and not original_format_valid[response_index]:
+                    original_judgement = False
+                intervened_judgement = bool(intervened_answer["judgement"][criterion_index])
+                criterion_effects[criterion_id] = (
+                    (1.0 if original_judgement else 0.0)
+                    - (1.0 if intervened_judgement else 0.0)
+                )
+            restored[item["batch_index"]][int(item["block_index"])] = {
+                "criterion_effects": criterion_effects,
+                "original_score": float(original["final_score"]),
+                "intervened_score": float(intervened_answer["final_score"]),
+                "score_effect": float(original["final_score"]) - float(intervened_answer["final_score"]),
+            }
+        return {int(batch_index): dict(value) for batch_index, value in restored.items()}
+
+    def _criterion_advantages_for_response(
+        self,
+        result: Mapping[str, Any],
+        response_index: int,
+    ) -> Dict[str, float]:
+        output = {}
+        for criterion_id, stats in result.get("criterion_stats", {}).items():
+            advantages = stats.get("advantages", [])
+            if response_index < len(advantages):
+                output[str(criterion_id)] = float(advantages[response_index])
+        return output
+
+    def _build_rcpc_token_advantages(
+        self,
+        group: Sequence[Dict[str, Any]],
+        result: Mapping[str, Any],
+        candidates: Sequence[Mapping[str, Any]],
+        interventions: Mapping[int, Mapping[int, Mapping[str, Any]]],
+    ) -> Tuple[Dict[int, List[float]], Dict[str, float]]:
+        token_advantages = {}
+        metric_values: Dict[str, List[float]] = defaultdict(list)
+        criterion_points = {
+            str(item["criterion_id"]): float(item["points"])
+            for item in result["rubric"]["rubrics"]
+        }
+        for response_index, (info, candidate) in enumerate(zip(group, candidates)):
+            batch_index = int(info["batch_index"])
+            values, metrics = build_token_advantages(
+                response_length=int(info["response_length"]),
+                blocks=candidate.get("candidate_blocks", []),
+                combined_advantage=float(result["criterion_advantages"].get(batch_index, 0.0)),
+                criterion_advantages=self._criterion_advantages_for_response(result, response_index),
+                criterion_points=criterion_points,
+                intervention_effects=interventions.get(batch_index),
+                fallback_to_full_response=self.rcpc_fallback_to_criterion_advantage,
+            )
+            token_advantages[batch_index] = values
+            for key, value in metrics.items():
+                metric_values[key].append(float(value))
+        metrics = {
+            key: (sum(values) / len(values) if values else 0.0)
+            for key, values in metric_values.items()
+        }
+        metrics["rcpc/enabled"] = 1.0
+        metrics["rcpc/intervention_enabled"] = 1.0 if self.rcpc_intervention_enabled else 0.0
+        metrics["rcpc/intervention_groups"] = 1.0 if interventions else 0.0
+        return token_advantages, metrics
 
     def _generate_teacher_answers(self, info: Dict[str, Any]) -> List[str]:
         prompt = _render_template(
@@ -1148,6 +1362,15 @@ class RopdIPRRewardScorer:
         print("[ropd scores]", result["scores"])
         if result.get("criterion_advantages"):
             print("[ropd criterion advantages]", result["criterion_advantages"])
+        if self.print_rcpc_outputs and result.get("rcpc_candidates"):
+            print("[ropd rcpc metrics]", json.dumps(result.get("rcpc_metrics", {}), ensure_ascii=False))
+            print("[ropd rcpc candidates]")
+            print(json.dumps(result["rcpc_candidates"], ensure_ascii=False, indent=2)[:20000])
+        if self.print_rcpc_outputs and result.get("rcpc_interventions"):
+            print("[ropd rcpc interventions]")
+            print(json.dumps(result["rcpc_interventions"], ensure_ascii=False, indent=2)[:20000])
+        if result.get("rcpc_error"):
+            print("[ropd rcpc error]", result["rcpc_error"])
         if self.print_rubric_outputs and result.get("rubric"):
             print("[ropd rubric]")
             print(json.dumps(result["rubric"], ensure_ascii=False, indent=2))
