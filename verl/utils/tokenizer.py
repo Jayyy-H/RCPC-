@@ -40,9 +40,6 @@ def get_tokenizer(model_path, correct_pad_token=True, correct_gemma=True, **kwar
         print("Found gemma model. Set eos_token and eos_token_id to <end_of_turn> and 107.")
         tokenizer.eos_token = "<end_of_turn>"
 
-    if getattr(config, "model_type", None) in ["valley"]:
-        correct_pad_token = False
-
     if correct_pad_token:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -50,13 +47,6 @@ def get_tokenizer(model_path, correct_pad_token=True, correct_gemma=True, **kwar
 
 
 def get_processor(model_path, **kwargs) -> Optional[ProcessorMixin]:
-    config = AutoConfig.from_pretrained(model_path, **kwargs)
-    if getattr(config, "model_type", None) in ["valley"]:
-        kwargs["anyres"] = config.anyres
-        kwargs["only_crop_single_image"] = config.only_crop_single_image
-        kwargs["grid_pinpoints"] = config.grid_pinpoints
-        kwargs["use_special_start_end_token"] = config.use_special_start_end_token
-        kwargs["only_navit"] = getattr(config, "only_navit", False)
     try:
         processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     except Exception:

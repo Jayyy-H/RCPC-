@@ -21,6 +21,7 @@ import uuid
 import glob
 import math
 import shutil
+import threading
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -33,7 +34,7 @@ import torch
 from codetiming import Timer
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
-from transformers import PreTrainedTokenizer, ProcessorMixin, AutoConfig
+from transformers import PreTrainedTokenizer, ProcessorMixin
 
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
@@ -43,9 +44,7 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer import core_algos
 from verl.trainer.config import PPOConfig
 from verl.utils.rl_dataset import RLHFDataset, collate_fn as collate_fn_default
-from verl.utils.rl_dataset_valley import RLHFDatasetValley, collate_fn as collate_fn_valley
 from verl.utils.sftrl_dataset import SFTRLDataset, collate_fn as collate_fn_sftrl
-from verl.utils.sftrl_dataset_valley import SFTRLDatasetValley, collate_fn as collate_fn_sftrl_valley
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import Tracking
 from verl.workers.fsdp_workers import FSDPWorker
@@ -53,6 +52,31 @@ from verl.utils.checkpoint.fsdp_checkpoint_manager import merge_shards
 
 
 WorkerType = Type[Worker]
+
+
+def _repeat_object_items(values: Any, repeat_times: int) -> np.ndarray:
+    """Repeat variable-length non-tensor items without NumPy shape coercion."""
+    repeated = []
+    for item in list(values):
+        if isinstance(item, np.ndarray):
+            item = item.tolist()
+        elif isinstance(item, tuple):
+            item = list(item)
+        for _ in range(repeat_times):
+            repeated.append(list(item) if isinstance(item, list) else item)
+    output = np.empty(len(repeated), dtype=object)
+    for index, item in enumerate(repeated):
+        output[index] = item
+    return output
+
+
+def _object_array(items: Any) -> np.ndarray:
+    """Build a one-dimensional object array even when items share a shape."""
+    items = list(items)
+    output = np.empty(len(items), dtype=object)
+    for index, item in enumerate(items):
+        output[index] = item
+    return output
 
 
 class Role(Enum):
@@ -354,6 +378,7 @@ class RayPPOTrainer:
         self.ray_worker_group_cls = ray_worker_group_cls
         self.best_val_reward_score = -1.0
         self.val_reward_score = 0.0
+        self._counterfactual_generation_lock = threading.Lock()
 
         # define KL control
         if self.use_reference_policy:
@@ -372,35 +397,30 @@ class RayPPOTrainer:
         else:
             raise NotImplementedError
         
-        # get dataset_cls and collate_fn accroding to model_type
-        model_config = AutoConfig.from_pretrained(self.config.worker.actor.model.model_path)
-        if getattr(model_config, "model_type", None) in ["valley"]:
-            if self.config.algorithm.rl_paradigm == 'sft+rl':
-                self.dataset_cls = SFTRLDatasetValley
-                self.collate_fn = collate_fn_sftrl_valley
-            else:
-                self.dataset_cls = RLHFDatasetValley
-                self.collate_fn = collate_fn_valley
+        if self.config.algorithm.rl_paradigm == 'sft+rl':
+            self.dataset_cls = SFTRLDataset
+            self.collate_fn = collate_fn_sftrl
         else:
-            if self.config.algorithm.rl_paradigm == 'sft+rl':
-                self.dataset_cls = SFTRLDataset
-                self.collate_fn = collate_fn_sftrl
-            else:
-                self.dataset_cls = RLHFDataset
-                self.collate_fn = collate_fn_default
+            self.dataset_cls = RLHFDataset
+            self.collate_fn = collate_fn_default
         self._create_dataloader()
 
     def _create_dataloader(self):
-        self.train_dataset = self.dataset_cls(
-            data_path=self.config.data.train_files,
+        dataset_kwargs = dict(
             tokenizer=self.tokenizer,
             processor=self.processor,
             prompt_key=self.config.data.prompt_key,
-            target_key=self.config.data.target_key,
             max_prompt_length=self.config.data.max_prompt_length,
             truncation="right",
             min_pixels=self.config.data.min_pixels,
             max_pixels=self.config.data.max_pixels,
+        )
+        if self.config.algorithm.rl_paradigm == "sft+rl":
+            dataset_kwargs["target_key"] = self.config.data.target_key
+
+        self.train_dataset = self.dataset_cls(
+            data_path=self.config.data.train_files,
+            **dataset_kwargs,
         )
         # use sampler for better ckpt resume
         if self.config.data.shuffle:
@@ -421,14 +441,7 @@ class RayPPOTrainer:
 
         self.val_dataset = self.dataset_cls(
             data_path=self.config.data.val_files,
-            tokenizer=self.tokenizer,
-            processor=self.processor,
-            prompt_key=self.config.data.prompt_key,
-            target_key=self.config.data.target_key,
-            max_prompt_length=self.config.data.max_prompt_length,
-            truncation="right",
-            min_pixels=self.config.data.min_pixels,
-            max_pixels=self.config.data.max_pixels,
+            **dataset_kwargs,
         )
 
         if self.config.data.val_batch_size is None:
@@ -643,6 +656,120 @@ class RayPPOTrainer:
                 if isinstance(item, (int, float)) and not math.isfinite(item):
                     raise ValueError(f"[actor metric validation] {stage}: metric {key} is non-finite: {item}")
 
+    def _attach_counterfactual_generator(self) -> None:
+        for reward_manager in (self.reward_fn, self.val_reward_fn):
+            if reward_manager is not None and hasattr(reward_manager, "set_counterfactual_generator"):
+                reward_manager.set_counterfactual_generator(self._generate_counterfactual_suffixes)
+
+    def _build_text_only_prompt_proto(
+        self,
+        prompt_id_lists: list[list[int]],
+        *,
+        max_new_tokens: int,
+    ) -> DataProto:
+        if not prompt_id_lists:
+            raise ValueError("empty counterfactual prompt list")
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+        max_prompt_len = max(len(item) for item in prompt_id_lists)
+        input_ids = torch.full((len(prompt_id_lists), max_prompt_len), int(pad_token_id), dtype=torch.long)
+        attention_mask = torch.zeros((len(prompt_id_lists), max_prompt_len), dtype=torch.long)
+        for row_index, token_ids in enumerate(prompt_id_lists):
+            if not token_ids:
+                token_ids = [int(pad_token_id)]
+            values = torch.tensor(token_ids, dtype=torch.long)
+            input_ids[row_index, -len(token_ids):] = values
+            attention_mask[row_index, -len(token_ids):] = 1
+        position_ids = torch.clip(attention_mask.cumsum(dim=-1) - 1, min=0)
+        return DataProto.from_dict(
+            tensors={
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+            non_tensors={
+                "raw_prompt_ids": _object_array([list(item) for item in prompt_id_lists]),
+            },
+            meta_info={
+                "do_sample": True,
+                "rcpc_counterfactual": True,
+                "max_new_tokens": int(max_new_tokens),
+                "skip_forced_response_prefix": True,
+                "sampling_kwargs": {
+                    "n": 1,
+                    "max_tokens": int(max_new_tokens),
+                    "temperature": self.config.worker.rollout.temperature,
+                    "top_p": self.config.worker.rollout.top_p,
+                    "top_k": self.config.worker.rollout.top_k,
+                },
+            },
+        )
+
+    def _generate_counterfactual_suffixes(self, requests) -> list[str]:
+        if not requests:
+            return []
+        max_model_len = int(self.config.data.max_prompt_length + self.config.data.max_response_length)
+        prompt_id_lists = []
+        prefix_texts = []
+        requested_new_tokens = []
+        forced_prefix = str(getattr(self.config.worker.rollout, "forced_response_prefix", "") or "")
+        forced_prefix_ids = (
+            self.tokenizer.encode(forced_prefix, add_special_tokens=False)
+            if forced_prefix
+            else []
+        )
+        for request in requests:
+            raw_prompt_ids = [int(token_id) for token_id in request.get("raw_prompt_ids", [])]
+            prefix_response_token_ids = [
+                int(token_id) for token_id in request.get("prefix_response_token_ids", [])
+            ]
+            if forced_prefix_ids and len(prefix_response_token_ids) < len(forced_prefix_ids):
+                prefix_response_token_ids = list(forced_prefix_ids)
+            prompt_ids = raw_prompt_ids + prefix_response_token_ids
+            if len(prompt_ids) >= max_model_len:
+                prompt_ids = prompt_ids[-(max_model_len - 1):]
+            prompt_id_lists.append(prompt_ids)
+            prefix_texts.append(
+                self.tokenizer.decode(
+                    prefix_response_token_ids,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+            )
+            requested_new_tokens.append(max(1, int(request.get("max_new_tokens", self.config.data.max_response_length))))
+
+        max_prompt_len = max(len(item) for item in prompt_id_lists)
+        max_new_tokens = min(max(requested_new_tokens), max(1, max_model_len - max_prompt_len))
+        if max_new_tokens <= 0:
+            return list(prefix_texts)
+
+        prompt_proto = self._build_text_only_prompt_proto(prompt_id_lists, max_new_tokens=max_new_tokens)
+        with self._counterfactual_generation_lock:
+            prompt_proto_padded, pad_size = pad_dataproto_to_divisor(
+                prompt_proto,
+                self.actor_rollout_wg.world_size,
+            )
+            output_padded = self.actor_rollout_wg.generate_sequences_val(
+                prompt_proto_padded
+            )
+            output = unpad_dataproto(output_padded, pad_size=pad_size)
+
+        response_ids = output.batch["responses"]
+        response_width = response_ids.shape[-1]
+        response_mask = output.batch["attention_mask"][:, -response_width:]
+        generated_texts = []
+        for row_index in range(response_ids.shape[0]):
+            valid_length = int(response_mask[row_index].sum().item())
+            suffix_ids = response_ids[row_index][:valid_length]
+            suffix_text = self.tokenizer.decode(
+                suffix_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+            generated_texts.append(prefix_texts[row_index] + suffix_text)
+        return generated_texts
+
     def _validate(self):
         reward_tensor_lst = []
         data_source_lst = []
@@ -677,6 +804,7 @@ class RayPPOTrainer:
             if "navit_processed_images" in test_batch.non_tensor_batch.keys():
                 non_tensor_batch_keys.append("navit_processed_images")
 
+            raw_prompt_ids_for_val = test_batch.non_tensor_batch.get("raw_prompt_ids", None)
             test_gen_batch = test_batch.pop(
                 batch_keys=batch_keys,
                 non_tensor_batch_keys=non_tensor_batch_keys
@@ -699,6 +827,17 @@ class RayPPOTrainer:
             sample_outputs.extend(output_texts)
 
             test_batch = test_batch.union(test_output_gen_batch)
+            if raw_prompt_ids_for_val is not None and "raw_prompt_ids" not in test_batch.non_tensor_batch:
+                test_batch.non_tensor_batch["raw_prompt_ids"] = raw_prompt_ids_for_val
+            if "uid" not in test_batch.non_tensor_batch:
+                test_batch.non_tensor_batch["uid"] = np.array(
+                    [f"val-{self.global_steps}-{i}-{j}" for j in range(len(test_batch.batch))],
+                    dtype=object,
+                )
+            # Validation metrics should measure generated-answer quality only.
+            # RCPC credit shaping and prefix-regeneration interventions are a
+            # training-time advantage redistribution mechanism.
+            test_batch.meta_info["skip_rcpc_credit"] = True
 
             # evaluate using reward_function
             reward_tensor = self.val_reward_fn(test_batch)
@@ -802,6 +941,7 @@ class RayPPOTrainer:
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg: FSDPWorker = all_wg["actor_rollout"]
         self.actor_rollout_wg.init_model()
+        self._attach_counterfactual_generator()
 
     def _save_checkpoint(self):
         
@@ -1031,6 +1171,7 @@ class RayPPOTrainer:
                 if "target_ids" in batch.non_tensor_batch.keys():
                     non_tensor_batch_keys.append("target_ids")
 
+                raw_prompt_ids_for_repeat = batch.non_tensor_batch.get("raw_prompt_ids", None)
                 gen_batch = batch.pop(
                     batch_keys=batch_keys,
                     non_tensor_batch_keys=non_tensor_batch_keys
@@ -1060,8 +1201,22 @@ class RayPPOTrainer:
                     batch.non_tensor_batch["uid"] = np.array(
                         [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                     )
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.worker.rollout.n + 1, interleave=True)
+                    # Repeat prompts to align with rollout outputs. In sft+rl,
+                    # vLLM appends one extra off-policy target per prompt; in
+                    # pure RL with QA-only data it returns only n on-policy
+                    # samples.
+                    repeat_times = len(gen_batch_output.batch) // len(batch.batch)
+                    if repeat_times < 1 or repeat_times * len(batch.batch) != len(gen_batch_output.batch):
+                        raise RuntimeError(
+                            "rollout output size {} is not divisible by prompt batch size {}".format(
+                                len(gen_batch_output.batch), len(batch.batch)
+                            )
+                        )
+                    batch = batch.repeat(repeat_times=repeat_times, interleave=True)
+                    if raw_prompt_ids_for_repeat is not None and "raw_prompt_ids" not in batch.non_tensor_batch:
+                        batch.non_tensor_batch["raw_prompt_ids"] = _repeat_object_items(
+                            raw_prompt_ids_for_repeat, repeat_times
+                        )
                     batch = batch.union(gen_batch_output)
 
                     # balance the number of valid tokens on each dp rank.
@@ -1071,6 +1226,7 @@ class RayPPOTrainer:
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    batch.meta_info["global_step"] = int(self.global_steps)
 
                     # recompute old_log_probs
                     with _timer("old_log_prob", timing_raw):

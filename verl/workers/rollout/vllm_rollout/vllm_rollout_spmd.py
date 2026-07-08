@@ -46,6 +46,12 @@ def _repeat_interleave(features: Union[torch.Tensor, List[Any]], repeats: int) -
         return [feature for feature in features for _ in range(repeats)]
 
 
+def _slice_batch_items(features: Any, length: int) -> Any:
+    if isinstance(features, torch.Tensor):
+        return features[:length]
+    return features[:length]
+
+
 def _sanitize_vllm_image(image: Any) -> Any:
     if Image is None or not isinstance(image, Image.Image):
         return image
@@ -207,6 +213,13 @@ class vLLMRollout(BaseRollout):
             setattr(self.sampling_params, key, value)
 
     def _generate_sequences(self, prompts: DataProto, include_targets: bool, **kwargs) -> DataProto:
+        sampling_overrides = dict(prompts.meta_info.get("sampling_kwargs") or {})
+        sampling_overrides.update(kwargs)
+        skip_forced_response_prefix = bool(
+            prompts.meta_info.get("skip_forced_response_prefix", False)
+            or sampling_overrides.pop("skip_forced_response_prefix", False)
+        )
+        forced_response_prefix_ids = [] if skip_forced_response_prefix else self.forced_response_prefix_ids
         # left-padded attention_mask
         input_ids: torch.Tensor = prompts.batch["input_ids"]  # (bs, prompt_length)
         attention_mask: torch.Tensor = prompts.batch["attention_mask"]
@@ -216,7 +229,7 @@ class vLLMRollout(BaseRollout):
 
         do_sample = prompts.meta_info.get("do_sample", True)
         if not do_sample:
-            kwargs = {
+            sampling_overrides = {
                 "n": 1,
                 "temperature": 0.0,
                 "top_p": 1.0,
@@ -236,7 +249,7 @@ class vLLMRollout(BaseRollout):
             for request_index, (raw_prompt_ids, images) in enumerate(
                 zip(non_tensor_batch.pop("raw_prompt_ids"), non_tensor_batch.pop("images"))
             ):
-                raw_prompt_ids = list(raw_prompt_ids) + self.forced_response_prefix_ids
+                raw_prompt_ids = list(raw_prompt_ids) + forced_response_prefix_ids
                 images = _sanitize_vllm_images(images)
                 image_uuids = _make_vllm_image_uuids(
                     self._mm_uuid_prefix, mm_uuid_call_id, request_index, images
@@ -250,12 +263,12 @@ class vLLMRollout(BaseRollout):
                 )
         else:
             vllm_inputs = [
-                {"prompt_token_ids": list(raw_prompt_ids) + self.forced_response_prefix_ids}
+                {"prompt_token_ids": list(raw_prompt_ids) + forced_response_prefix_ids}
                 for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")
             ]
 
         # users can customize different sampling_params at different run
-        with self.update_sampling_params(**kwargs):
+        with self.update_sampling_params(**sampling_overrides):
             completions: List[RequestOutput] = self.inference_engine.generate(
                 prompts=vllm_inputs, sampling_params=self.sampling_params
             )
@@ -264,7 +277,7 @@ class vLLMRollout(BaseRollout):
         is_onpolicy = []
         for index, completion in enumerate(completions):
             for output in completion.outputs:
-                response_ids.append(self.forced_response_prefix_ids + list(output.token_ids))
+                response_ids.append(forced_response_prefix_ids + list(output.token_ids))
                 is_onpolicy.append(True)
             if target_ids is not None:
                 response_ids.append(target_ids[index])
@@ -274,8 +287,38 @@ class vLLMRollout(BaseRollout):
             response_ids, self.pad_token_id, max_length=self.config.response_length
         ).to(input_ids.device)
 
-        rollout_count = self.config.n if do_sample else 1
+        # Use the effective sampling `n`, not only the static rollout config.
+        # RCPC prefix-regeneration overrides n=1 through sampling_kwargs while
+        # keeping do_sample=True. If we used self.config.n here, prompts would
+        # be repeated as normal rollouts (for example 6 -> 48) even though vLLM
+        # returned only one suffix per prompt, causing input/response batch
+        # mismatch at torch.cat below.
+        rollout_count = int(sampling_overrides.get("n", self.config.n if do_sample else 1))
+        rollout_count = max(1, rollout_count)
         repeat_count = rollout_count + 1 if target_ids is not None else rollout_count
+        if repeat_count == 1 and response_ids.size(0) != batch_size:
+            # For single-sample generation paths (validation and RCPC
+            # prefix-regeneration), the sharding manager can present an
+            # all-gathered tensor batch to the rollout worker while vLLM returns
+            # only the local requests handled by that worker. Keep the output
+            # package aligned to the generated responses before concatenating
+            # prompt and response tensors. Normal training rollouts have
+            # repeat_count > 1 and still use the standard repeat path below.
+            local_batch_size = response_ids.size(0)
+            if local_batch_size <= 0 or local_batch_size > batch_size:
+                raise RuntimeError(
+                    "vLLM response batch {} is incompatible with prompt batch {}".format(
+                        local_batch_size, batch_size
+                    )
+                )
+            input_ids = input_ids[:local_batch_size]
+            attention_mask = attention_mask[:local_batch_size]
+            position_ids = position_ids[:local_batch_size]
+            for key in list(non_tensor_batch.keys()):
+                value = non_tensor_batch[key]
+                if hasattr(value, "__len__") and len(value) == batch_size:
+                    non_tensor_batch[key] = _slice_batch_items(value, local_batch_size)
+            batch_size = local_batch_size
         if repeat_count > 1:
             batch_size = batch_size * repeat_count
             input_ids = _repeat_interleave(input_ids, repeat_count)
@@ -312,8 +355,7 @@ class vLLMRollout(BaseRollout):
         )
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
-        if target_ids is not None:
-            non_tensor_batch["is_onpolicy"] = is_onpolicy
+        non_tensor_batch["is_onpolicy"] = is_onpolicy
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
         batch = TensorDict(

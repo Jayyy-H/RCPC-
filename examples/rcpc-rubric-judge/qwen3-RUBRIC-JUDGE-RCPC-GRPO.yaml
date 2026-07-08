@@ -1,0 +1,151 @@
+data:
+  # Training samples must contain at least:
+  #   question: str
+  #   answer or reference_answer: str
+  #   rubric: list[{"title": str, "description": str, "weight": number}]
+  train_files: "/mnt/bn/chenhaobo-va-data/lrj/data/RaR-Science-20k-o3-mini/splits/rl_rubrics_train.jsonl"
+  val_files: "/mnt/bn/chenhaobo-va-data/lrj/data/RaR-Science-20k-o3-mini/splits/val_rubrics.jsonl"
+  prompt_key: question
+  target_key: cot
+  max_prompt_length: 8192
+  max_response_length: 4096
+  rollout_batch_size: 16
+  shuffle: true
+  seed: 1
+  max_pixels: 0
+  min_pixels: 0
+
+algorithm:
+  adv_estimator: grpo
+  kl_coef: 0.0
+  rl_paradigm: rl
+
+worker:
+  actor:
+    global_batch_size: 16
+    micro_batch_size_per_device_for_update: 1
+    micro_batch_size_per_device_for_experience: 1
+    max_grad_norm: 1.0
+    use_kl_loss: false
+    kl_loss_coef: 0
+    kl_loss_type: low_var_kl
+    sft_coef: 0
+    sft_coef_decay_step: 40
+    sft_coef_decay_rate: 0.1
+    model:
+      model_path: /mnt/bn/chenhaobo-va-data/lrj/checkpoints/rcpc/qwen3-4b-RaRScience-sft/final
+      enable_gradient_checkpointing: true
+      trust_remote_code: true
+      attn_implementation: flash_attention_2
+    optim:
+      lr: 5.0e-6
+      weight_decay: 1.0e-2
+    fsdp:
+      enable_full_shard: false
+      param_offload: false
+      optimizer_offload: true
+      torch_dtype: bf16
+    offload:
+      param_offload: true
+      optimizer_offload: true
+
+  rollout:
+    name: "vllm"
+    temperature: 1.0
+    seed: 0
+    forced_response_prefix: "<reasoning>\n"
+    tensor_parallel_size: 2
+    gpu_memory_utilization: 0.6
+    n: 8
+    limit_images: 0
+    max_image_num: 0
+    mm_processor_cache_gb: -1
+    disable_mm_preprocessor_cache: true
+    enable_chunked_prefill: false
+    max_num_batched_tokens: 32768
+    max_num_seqs: 256
+
+  ref:
+    offload:
+      param_offload: true
+
+  reward:
+    reward_type: function
+    compute_score: rubric_judge_rcpc
+    num_examine: 0
+    # The fixed-rubric path calls only this verifier model. Teacher/rubricator
+    # settings are ignored by FixedRubricRCPCRewardScorer.
+    ropd_model: judge-model
+    ropd_api_style: responses
+    ropd_api_key_env: JUDGE_API_KEY
+    ropd_base_url_env: JUDGE_BASE_URL
+    ropd_max_concurrency: 16
+    ropd_request_timeout: 120.0
+    ropd_verifier_max_output_tokens: 2048
+    ropd_prompt_dir: prompts/rcpc_rubric_judge
+    ropd_include_ground_truth: true
+    ropd_include_images: false
+    ropd_print_teacher_outputs: false
+    ropd_print_student_outputs: false
+    ropd_print_max_student_outputs: 3
+    ropd_print_rubric_outputs: false
+    ropd_print_verifier_outputs: false
+    ropd_require_strict_cot_format: true
+    # Track strict CoT format as a metric, but do not collapse fixed-rubric
+    # reward/criterion signal to zero while the SFT checkpoint is still learning
+    # to close <reasoning> and emit <answer>. Otherwise reward becomes identically
+    # zero and RCPC cannot select interventions.
+    ropd_zero_score_on_format_error: false
+    ropd_zero_criteria_on_format_error: false
+    ropd_fallback_to_ipr: false
+    ropd_score_offpolicy: false
+    ropd_use_criterion_advantage: true
+
+    ropd_rcpc_enabled: true
+    ropd_rcpc_use_token_advantage: true
+    # Canonical RCPC budget B_group. By default this single knob controls
+    # candidate discovery and the number of prefix-regeneration interventions:
+    # effective_top_blocks = B_group, effective_top_actions = 2 * B_group,
+    # max_intervention_blocks_per_group = B_group.
+    ropd_rcpc_budget: 32
+    ropd_rcpc_derive_candidates_from_budget: true
+    ropd_rcpc_min_action_chars: 12
+    ropd_rcpc_max_action_chars: 260
+    ropd_rcpc_max_action_tokens: 24
+    ropd_rcpc_min_robust_denom: 0.05
+    ropd_rcpc_min_anchor_z: 0.5
+    ropd_rcpc_intervention_enabled: true
+    ropd_rcpc_intervention_max_groups_per_batch: -1
+    ropd_rcpc_intervention_mode: prefix_regen
+    ropd_rcpc_batch_counterfactual: true
+    ropd_rcpc_counterfactual_samples: 2
+    ropd_rcpc_counterfactual_batch_size: 128
+    ropd_rcpc_transport_lambda: 1.0
+    ropd_rcpc_effect_noise_floor: 0.05
+    ropd_rcpc_fallback_to_criterion_advantage: true
+    ropd_print_rcpc_outputs: false
+    ropd_rcpc_print_intervention_summary: true
+    ropd_rcpc_print_interval: 10
+    ropd_rcpc_print_max_groups: 1
+    ropd_rcpc_print_max_blocks: 16
+
+    ropd_shadow_attribution_enabled: false
+    ropd_debug_path: null
+
+trainer:
+  total_episodes: 40
+  logger: ["console", "wandb"]
+  project_name: rcpc-rubric-judge
+  experiment_name: qwen3-rubric-judge-RCPC-GRPO
+  n_gpus_per_node: 8
+  nnodes: 1
+  save_freq: 10
+  test_freq: 10
+  val_before_train: true
+  val_only: false
+  save_checkpoint_path: /mnt/bn/chenhaobo-va-data/lrj/checkpoints/rcpc/qwen3-4b-RUBRIC-JUDGE-RCPC-GRPO/
+  load_checkpoint_path: null
+  save_ckpt_limit: 20
+  save_shard_limit: 10
+  val_generations_to_log_to_wandb: 10
+  max_val_batches: 1

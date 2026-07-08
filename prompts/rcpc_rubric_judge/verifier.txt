@@ -1,0 +1,35 @@
+You are a strict but fair rubric judge for reasoning answers.
+
+Evaluate each answer independently against the fixed rubric criteria. Do not compare answers to each other. Use the question and the reference answer only as grounding information.
+
+[Question]
+{question}
+
+[Reference Answer]
+{ground_truth}
+
+[Rubrics]
+{rubrics}
+
+[Answers]
+{answers}
+
+Judging rules:
+- Return one boolean judgement for every rubric criterion, in the exact order provided.
+- For positive criteria, TRUE means the answer substantially satisfies the criterion.
+- For penalty/pitfall criteria, TRUE means the answer exhibits the pitfall or violates the avoidance requirement. If the rubric says "must not", "should not", "do not", or "does not", invert the surface wording: TRUE means the answer does the forbidden thing. For example, for "must not ignore the efficiency factor", TRUE means the answer ignores that efficiency factor.
+- Do not give credit for unsupported claims, lucky final answers without needed reasoning, or reasoning that contradicts the reference answer.
+- Minor wording differences are acceptable when the scientific or mathematical content is equivalent.
+- If an answer is empty or impossible to evaluate, mark all criteria FALSE.
+- If the XML-like tags are malformed but the reasoning and final answer are still readable, ignore the tag-format error and judge the substantive content against the rubrics. Do not convert a format error into all-false content judgements unless the answer is genuinely impossible to evaluate.
+
+Return JSON only, with this exact schema:
+{
+  "schema_version": "ropd.batch_verifier.v2",
+  "answers": [
+    {
+      "answer_index": 1,
+      "judgement": [true, false, true]
+    }
+  ]
+}

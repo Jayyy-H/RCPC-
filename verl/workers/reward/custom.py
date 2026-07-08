@@ -18,6 +18,7 @@ from transformers import PreTrainedTokenizer
 
 from verl import DataProto
 from verl.utils.reward_score import math_compute_score, product_compute_score, ipr_compute_score
+from verl.utils.reward_score.rubric_judge_rcpc import FixedRubricRCPCRewardScorer
 from verl.utils.reward_score.ropd import RopdIPRRewardScorer
 
 
@@ -38,15 +39,26 @@ class CustomRewardManager:
             self.compute_score = product_compute_score
         elif compute_score == "ipr":
             self.compute_score = ipr_compute_score
-        elif compute_score in {"ropd", "ropd_ipr"}:
+        elif compute_score in {"ropd", "ropd_ipr", "ropd_rcpc"}:
             self.compute_score = None
             self.ropd_scorer = RopdIPRRewardScorer(
                 tokenizer=tokenizer,
                 reward_config=reward_config,
                 num_examine=num_examine,
             )
+        elif compute_score in {"rubric_judge_rcpc", "fixed_rubric_rcpc"}:
+            self.compute_score = None
+            self.ropd_scorer = FixedRubricRCPCRewardScorer(
+                tokenizer=tokenizer,
+                reward_config=reward_config,
+                num_examine=num_examine,
+            )
         else:
             raise NotImplementedError()
+
+    def set_counterfactual_generator(self, generator):
+        if self.ropd_scorer is not None:
+            self.ropd_scorer.set_counterfactual_generator(generator)
 
     def __call__(self, data: DataProto) -> torch.Tensor:
         if self.ropd_scorer is not None:
@@ -77,7 +89,8 @@ class CustomRewardManager:
             ground_truth = data_item.non_tensor_batch["answer"]
 
             score = self.compute_score(response_str, ground_truth)
-            reward_tensor[i, valid_response_length - 1] = score
+            if valid_response_length > 0:
+                reward_tensor[i, valid_response_length - 1] = score
 
             if already_print < self.num_examine:
                 already_print += 1

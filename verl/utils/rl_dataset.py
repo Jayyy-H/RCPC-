@@ -78,6 +78,90 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _first_nonempty(row_dict: Dict[str, Any], keys: List[str]) -> str:
+    for key in keys:
+        value = row_dict.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            value = str(value)
+        value = value.strip()
+        if value:
+            return value
+    return ""
+
+
+def _format_webinstruct_prompt(row_dict: Dict[str, Any], prompt_key: str) -> str:
+    prompt = _first_nonempty(row_dict, [prompt_key, "problem", "prompt", "instruction", "input"])
+    if prompt:
+        return prompt
+
+    parts = []
+    metadata = []
+    discipline = _first_nonempty(row_dict, ["discipline"])
+    difficulty = _first_nonempty(row_dict, ["difficulty"])
+    task_type = _first_nonempty(row_dict, ["type", "question_type"])
+    if discipline:
+        metadata.append(f"Discipline: {discipline}")
+    if difficulty:
+        metadata.append(f"Difficulty: {difficulty}")
+    if task_type:
+        metadata.append(f"Type: {task_type}")
+    if metadata:
+        parts.append("\n".join(metadata))
+
+    original_document = _first_nonempty(row_dict, ["original_document", "document", "context"])
+    design_logic = _first_nonempty(row_dict, ["design_logic"])
+    question = _first_nonempty(row_dict, ["question", "query"])
+    if original_document:
+        parts.append(f"[Context]\n{original_document}")
+    if design_logic:
+        parts.append(f"[Design Logic]\n{design_logic}")
+    if question:
+        parts.append(f"[Question]\n{question}")
+    if not parts:
+        raise KeyError(f"missing prompt field {prompt_key!r} and WebInstruct fallback fields")
+    return "\n\n".join(parts).strip()
+
+
+def _maybe_wrap_question(text: str) -> str:
+    text = text.strip()
+    if not _env_flag("RCPC_WRAP_QUESTION_TAGS", False):
+        return text
+    lowered = text.lower()
+    if "<question>" in lowered and "</question>" in lowered:
+        return text
+    return f"<question>\n{text}\n</question>"
+
+
+def _student_response_instruction() -> str:
+    return os.getenv(
+        "RCPC_STUDENT_RESPONSE_INSTRUCTION",
+        "Please solve the problem and output exactly one response in this format:\n"
+        "<reasoning>\n"
+        "Your concise reasoning.\n"
+        "</reasoning>\n"
+        "<answer>\n"
+        "Your final answer.\n"
+        "</answer>\n"
+        "You must close </reasoning> before starting <answer>. Do not output <think>, </think>, "
+        "<tool_call>, tool-use markup, function-call markup, markdown code fences, or any text "
+        "outside the <reasoning>...</reasoning><answer>...</answer> tags.",
+    ).strip()
+
+
+def _apply_chat_template_no_thinking(tokenizer: PreTrainedTokenizer, messages: List[Dict[str, str]]) -> str:
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+            enable_thinking=False,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+
+
 def _check_qwen_image_prompt(
     tokenizer: PreTrainedTokenizer,
     processor: ProcessorMixin,
@@ -170,11 +254,11 @@ class RLHFDataset(Dataset):
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
         row_dict = dict(self.dataset[index])
-        messages = [
-            {"role": "system", "content": r"Please reason step by step, and put your final answer within \boxed{}."},
-            {"role": "user", "content": row_dict[self.prompt_key] + r"Please reason step by step, first output your thinking process, and then put your final answer within \boxed{}."},
-        ]
-        prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        prompt_text = _maybe_wrap_question(_format_webinstruct_prompt(row_dict, self.prompt_key))
+        instruction = _student_response_instruction()
+        user_content = f"{prompt_text}\n\n{instruction}" if instruction else prompt_text
+        messages = [{"role": "user", "content": user_content}]
+        prompt = _apply_chat_template_no_thinking(self.tokenizer, messages)
 
         if "image" in row_dict: # Robust
             row_dict["images"] = row_dict["image"]
@@ -251,4 +335,6 @@ class RLHFDataset(Dataset):
         row_dict["attention_mask"] = attention_mask
         row_dict["position_ids"] = position_ids
         row_dict["raw_prompt_ids"] = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+        row_dict["raw_prompt"] = prompt_text
+        row_dict["answer"] = _first_nonempty(row_dict, ["answer", "final_answer", "reference_answer"])
         return row_dict

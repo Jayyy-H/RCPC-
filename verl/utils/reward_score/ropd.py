@@ -4,10 +4,12 @@ import json
 import mimetypes
 import os
 import re
+import threading
+import time
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -27,25 +29,25 @@ SHADOW_ATTRIBUTION_SCHEMA_VERSION = "ropd.shadow_attribution.v1"
 
 
 _PLACEHOLDER_RE = re.compile(r"\{([a-z_][a-z0-9_]*)\}")
-_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
+_REASONING_RE = re.compile(r"<reasoning>(.*?)</reasoning>", re.DOTALL | re.IGNORECASE)
 _ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
 _SUBSTANTIVE_RE = re.compile(r"[\w\u4e00-\u9fff]", re.UNICODE)
 
 
 def _has_strict_cot_format(text: str) -> bool:
-    think_matches = list(_THINK_RE.finditer(str(text)))
+    reasoning_matches = list(_REASONING_RE.finditer(str(text)))
     answer_matches = list(_ANSWER_RE.finditer(str(text)))
-    if len(think_matches) != 1 or len(answer_matches) != 1:
+    if len(reasoning_matches) != 1 or len(answer_matches) != 1:
         return False
 
-    think_match = think_matches[0]
+    reasoning_match = reasoning_matches[0]
     answer_match = answer_matches[0]
-    if think_match.end() > answer_match.start():
+    if reasoning_match.end() > answer_match.start():
         return False
-    if not _SUBSTANTIVE_RE.search(think_match.group(1).strip()):
+    if not _SUBSTANTIVE_RE.search(reasoning_match.group(1).strip()):
         return False
 
-    return answer_match.group(1).strip().upper() in {"YES", "NO"}
+    return bool(_SUBSTANTIVE_RE.search(answer_match.group(1).strip()))
 
 
 def _cfg(config: Any, name: str, default: Any) -> Any:
@@ -72,7 +74,7 @@ def _normalize_openai_base_url(base_url: Optional[str], api_style: str) -> Optio
         return None
     normalized = str(base_url).strip().rstrip("/")
     # OpenAI SDK appends `/responses` for `client.responses.create(...)`.
-    # Some internal modelhub configs store the full responses endpoint.
+    # Some gateways store the full responses endpoint in their base URL.
     if api_style == "responses" and normalized.endswith("/responses"):
         normalized = normalized[: -len("/responses")]
     if api_style == "chat_completions" and normalized.endswith("/chat/completions"):
@@ -377,8 +379,15 @@ class RopdIPRRewardScorer:
         self.tokenizer = tokenizer
         self.num_examine = num_examine
         self.already_print = 0
+        self._print_lock = threading.Lock()
+        self._counterfactual_lock = threading.Lock()
+        self._current_global_step = -1
+        self._rcpc_summary_printed_by_step: Dict[int, int] = {}
+        self._counterfactual_generator: Optional[Callable[[Sequence[Mapping[str, Any]]], List[str]]] = None
 
-        base_model = os.getenv("ROPD_MODEL") or _cfg(reward_config, "ropd_model", "gpt-5.4")
+        base_model = os.getenv("JUDGE_MODEL") or os.getenv("ROPD_MODEL") or _cfg(
+            reward_config, "ropd_model", "judge-model"
+        )
         self.teacher_model = os.getenv("ROPD_TEACHER_MODEL") or _cfg(
             reward_config, "ropd_teacher_model", None
         ) or base_model
@@ -395,6 +404,7 @@ class RopdIPRRewardScorer:
         self.filter_teacher_by_answer = bool(_cfg(reward_config, "ropd_filter_teacher_by_answer", True))
         self.print_teacher_outputs = bool(_cfg(reward_config, "ropd_print_teacher_outputs", True))
         self.print_student_outputs = bool(_cfg(reward_config, "ropd_print_student_outputs", False))
+        self.print_max_student_outputs = int(_cfg(reward_config, "ropd_print_max_student_outputs", 0))
         self.print_rubric_outputs = bool(_cfg(reward_config, "ropd_print_rubric_outputs", False))
         self.print_verifier_outputs = bool(_cfg(reward_config, "ropd_print_verifier_outputs", False))
         self.print_shadow_attributions = bool(_cfg(reward_config, "ropd_print_shadow_attributions", False))
@@ -407,26 +417,66 @@ class RopdIPRRewardScorer:
         )
         self.rcpc_enabled = bool(_cfg(reward_config, "ropd_rcpc_enabled", False))
         self.rcpc_use_token_advantage = bool(_cfg(reward_config, "ropd_rcpc_use_token_advantage", True))
-        self.rcpc_top_actions = max(1, int(_cfg(reward_config, "ropd_rcpc_top_actions", 12)))
-        self.rcpc_top_blocks = max(1, int(_cfg(reward_config, "ropd_rcpc_top_blocks", 6)))
+        self.rcpc_budget = max(1, int(_cfg(reward_config, "ropd_rcpc_budget", 32)))
+        self.rcpc_derive_candidates_from_budget = bool(
+            _cfg(reward_config, "ropd_rcpc_derive_candidates_from_budget", True)
+        )
+        if self.rcpc_derive_candidates_from_budget:
+            # The method-level budget is B_group: the number of local causal
+            # interventions allowed for one prompt group. Candidate discovery
+            # is derived from the same knob so experiments do not silently use
+            # inconsistent action/block/intervention budgets.
+            self.rcpc_top_blocks = self.rcpc_budget
+            self.rcpc_top_actions = max(2, self.rcpc_budget * 2)
+        else:
+            self.rcpc_top_actions = max(1, int(_cfg(reward_config, "ropd_rcpc_top_actions", 12)))
+            self.rcpc_top_blocks = max(1, int(_cfg(reward_config, "ropd_rcpc_top_blocks", 6)))
         self.rcpc_min_action_chars = max(1, int(_cfg(reward_config, "ropd_rcpc_min_action_chars", 12)))
         self.rcpc_max_action_chars = max(1, int(_cfg(reward_config, "ropd_rcpc_max_action_chars", 260)))
         self.rcpc_max_action_tokens = max(1, int(_cfg(reward_config, "ropd_rcpc_max_action_tokens", 24)))
         self.rcpc_min_robust_denom = float(_cfg(reward_config, "ropd_rcpc_min_robust_denom", 0.05))
         self.rcpc_min_anchor_z = float(_cfg(reward_config, "ropd_rcpc_min_anchor_z", 0.5))
         self.rcpc_intervention_enabled = bool(_cfg(reward_config, "ropd_rcpc_intervention_enabled", False))
-        self.rcpc_intervention_max_groups_per_batch = max(
-            0, int(_cfg(reward_config, "ropd_rcpc_intervention_max_groups_per_batch", 1))
+        self.rcpc_intervention_max_groups_per_batch = int(
+            _cfg(reward_config, "ropd_rcpc_intervention_max_groups_per_batch", -1)
         )
-        self.rcpc_intervention_max_blocks_per_answer = max(
-            0, int(_cfg(reward_config, "ropd_rcpc_intervention_max_blocks_per_answer", 2))
-        )
+        if self.rcpc_derive_candidates_from_budget:
+            self.rcpc_intervention_max_blocks_per_answer = 0
+            self.rcpc_intervention_max_blocks_per_group = self.rcpc_budget
+        else:
+            self.rcpc_intervention_max_blocks_per_answer = int(
+                _cfg(reward_config, "ropd_rcpc_intervention_max_blocks_per_answer", 0)
+            )
+            self.rcpc_intervention_max_blocks_per_group = max(
+                0, int(_cfg(reward_config, "ropd_rcpc_intervention_max_blocks_per_group", 16))
+            )
         self.rcpc_intervention_mode = str(_cfg(reward_config, "ropd_rcpc_intervention_mode", "mask"))
+        self.rcpc_batch_counterfactual = bool(_cfg(reward_config, "ropd_rcpc_batch_counterfactual", True))
+        self.rcpc_counterfactual_samples = max(
+            1, int(_cfg(reward_config, "ropd_rcpc_counterfactual_samples", 1))
+        )
+        self.rcpc_counterfactual_batch_size = int(
+            _cfg(reward_config, "ropd_rcpc_counterfactual_batch_size", 128)
+        )
+        self.rcpc_transport_lambda = float(_cfg(reward_config, "ropd_rcpc_transport_lambda", 1.0))
+        self.rcpc_effect_noise_floor = float(_cfg(reward_config, "ropd_rcpc_effect_noise_floor", 0.05))
         self.rcpc_fallback_to_criterion_advantage = bool(
             _cfg(reward_config, "ropd_rcpc_fallback_to_criterion_advantage", True)
         )
         self.print_rcpc_outputs = bool(_cfg(reward_config, "ropd_print_rcpc_outputs", False))
+        self.rcpc_print_intervention_summary = bool(
+            _cfg(reward_config, "ropd_rcpc_print_intervention_summary", True)
+        )
+        self.rcpc_print_interval = int(_cfg(reward_config, "ropd_rcpc_print_interval", 10))
+        self.rcpc_print_max_groups = int(_cfg(reward_config, "ropd_rcpc_print_max_groups", 1))
+        self.rcpc_print_max_blocks = int(_cfg(reward_config, "ropd_rcpc_print_max_blocks", 16))
         self.require_strict_cot_format = bool(_cfg(reward_config, "ropd_require_strict_cot_format", True))
+        self.zero_score_on_format_error = bool(
+            _cfg(reward_config, "ropd_zero_score_on_format_error", self.require_strict_cot_format)
+        )
+        self.zero_criteria_on_format_error = bool(
+            _cfg(reward_config, "ropd_zero_criteria_on_format_error", self.require_strict_cot_format)
+        )
         self.final_label_points_cap = int(_cfg(reward_config, "ropd_final_label_points_cap", 1))
         self.format_points_cap = int(_cfg(reward_config, "ropd_format_points_cap", 1))
         self.teacher_temperature = _optional_float(_cfg(reward_config, "ropd_teacher_temperature", None))
@@ -440,16 +490,25 @@ class RopdIPRRewardScorer:
         )
 
         repo_root = Path(__file__).resolve().parents[3]
-        prompt_dir_value = str(_cfg(reward_config, "ropd_prompt_dir", "prompts/ropd"))
+        prompt_dir_value = str(_cfg(reward_config, "ropd_prompt_dir", "prompts/rcpc_rubric_judge"))
         prompt_dir = Path(prompt_dir_value)
         if not prompt_dir.is_absolute():
             prompt_dir = repo_root / prompt_dir
-        self.teacher_template = (prompt_dir / "teacher.txt").read_text(encoding="utf-8")
-        self.rubricator_template = (prompt_dir / "rubricator.txt").read_text(encoding="utf-8")
+
+        def _read_optional_prompt(filename: str) -> Optional[str]:
+            path = prompt_dir / filename
+            if path.exists():
+                return path.read_text(encoding="utf-8")
+            return None
+
+        self.teacher_template = _read_optional_prompt("teacher.txt")
+        self.rubricator_template = _read_optional_prompt("rubricator.txt")
         self.verifier_template = (prompt_dir / "verifier.txt").read_text(encoding="utf-8")
         self.attributor_template = None
         if self.shadow_attribution_enabled:
-            self.attributor_template = (prompt_dir / "attributor.txt").read_text(encoding="utf-8")
+            self.attributor_template = _read_optional_prompt("attributor.txt")
+            if self.attributor_template is None:
+                raise FileNotFoundError(f"Missing attributor prompt: {prompt_dir / 'attributor.txt'}")
 
         debug_path_value = _cfg(reward_config, "ropd_debug_path", None)
         self.debug_path = Path(debug_path_value) if debug_path_value else None
@@ -457,18 +516,30 @@ class RopdIPRRewardScorer:
             self.debug_path = repo_root / self.debug_path
 
         self.client = RopdOpenAIClient(
-            api_key_env=str(_cfg(reward_config, "ropd_api_key_env", "OPENAI_API_KEY")),
+            api_key_env=str(_cfg(reward_config, "ropd_api_key_env", "JUDGE_API_KEY")),
             base_url=_cfg(reward_config, "ropd_base_url", None),
-            base_url_env=str(_cfg(reward_config, "ropd_base_url_env", "OPENAI_BASE_URL")),
+            base_url_env=str(_cfg(reward_config, "ropd_base_url_env", "JUDGE_BASE_URL")),
             api_style=str(_cfg(reward_config, "ropd_api_style", "responses")),
             timeout=float(_cfg(reward_config, "ropd_request_timeout", 120.0)),
             include_images=bool(_cfg(reward_config, "ropd_include_images", True)),
             max_image_bytes=int(_cfg(reward_config, "ropd_max_image_bytes", 8388608)),
         )
 
+    def set_counterfactual_generator(
+        self,
+        generator: Optional[Callable[[Sequence[Mapping[str, Any]]], List[str]]],
+    ) -> None:
+        self._counterfactual_generator = generator
+
     def __call__(self, data: DataProto) -> torch.Tensor:
+        call_start = time.perf_counter()
+        call_metrics: Dict[str, float] = {}
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+        self._current_global_step = int(data.meta_info.get("global_step", -1))
+        section_start = time.perf_counter()
         response_infos = self._collect_response_infos(data)
+        call_metrics["timing_s/reward/collect_response_infos"] = time.perf_counter() - section_start
+        skip_rcpc_credit = bool(data.meta_info.get("skip_rcpc_credit", False))
 
         if not self._has_training_group_keys(data):
             self._fill_rule_rewards(reward_tensor, response_infos)
@@ -476,28 +547,56 @@ class RopdIPRRewardScorer:
 
         grouped = self._group_onpolicy_infos(response_infos)
         groups = list(grouped.values())
+        for group in groups:
+            group[0]["skip_rcpc_credit"] = skip_rcpc_credit
+        defer_rcpc_interventions = self._should_defer_rcpc_interventions(skip_rcpc_credit)
         if self.shadow_attribution_enabled:
             for group_index, group in enumerate(groups):
                 group[0]["run_shadow_attribution"] = (
                     group_index < self.shadow_attribution_max_groups_per_batch
                 )
-        if self.rcpc_enabled and self.rcpc_intervention_enabled:
+        if self.rcpc_enabled and self.rcpc_intervention_enabled and not skip_rcpc_credit:
             for group_index, group in enumerate(groups):
-                group[0]["run_rcpc_intervention"] = (
-                    group_index < self.rcpc_intervention_max_groups_per_batch
+                run_intervention = (
+                    self.rcpc_intervention_max_groups_per_batch < 0
+                    or group_index < self.rcpc_intervention_max_groups_per_batch
                 )
+                group[0]["run_rcpc_intervention"] = (
+                    run_intervention and not defer_rcpc_interventions
+                )
+                group[0]["deferred_rcpc_intervention"] = run_intervention and defer_rcpc_interventions
+                if defer_rcpc_interventions:
+                    group[0]["defer_group_print"] = True
+        call_metrics["reward/group_count"] = float(len(groups))
+        call_metrics["reward/group_size/mean"] = (
+            sum(len(group) for group in groups) / len(groups) if groups else 0.0
+        )
+        call_metrics["reward/max_concurrency"] = float(min(self.max_concurrency, max(1, len(groups))))
+        section_start = time.perf_counter()
         if self.max_concurrency <= 1 or len(groups) <= 1:
             results = [self._score_group(group) for group in groups]
         else:
             with ThreadPoolExecutor(max_workers=min(self.max_concurrency, len(groups))) as executor:
                 results = list(executor.map(self._score_group, groups))
+        call_metrics["timing_s/reward/score_groups_wall"] = time.perf_counter() - section_start
 
+        if defer_rcpc_interventions:
+            section_start = time.perf_counter()
+            call_metrics.update(self._run_deferred_rcpc_interventions(groups, results))
+            call_metrics["timing_s/reward/deferred_rcpc_wall"] = time.perf_counter() - section_start
+            for group, result in zip(groups, results):
+                self._maybe_print_group(group[0], result)
+
+        section_start = time.perf_counter()
         for result in results:
             for batch_index, score in result["scores"].items():
                 response_length = response_infos[batch_index]["response_length"]
-                reward_tensor[batch_index, response_length - 1] = float(score)
+                if response_length > 0:
+                    reward_tensor[batch_index, response_length - 1] = float(score)
+        call_metrics["timing_s/reward/fill_reward_tensor"] = time.perf_counter() - section_start
 
         if self.use_criterion_advantage:
+            section_start = time.perf_counter()
             criterion_advantage_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
             for result in results:
                 rcpc_token_advantages = result.get("rcpc_token_advantages", {}) if self.rcpc_enabled else {}
@@ -514,30 +613,151 @@ class RopdIPRRewardScorer:
                     else:
                         criterion_advantage_tensor[batch_index, :response_length] = float(advantage)
             data.batch["criterion_advantages"] = criterion_advantage_tensor
-            data.meta_info["ropd_metrics"] = self._collect_criterion_metrics(results)
+            call_metrics["timing_s/reward/build_criterion_tensor"] = time.perf_counter() - section_start
+            metrics = self._collect_criterion_metrics(results)
+            call_metrics["timing_s/reward/total"] = time.perf_counter() - call_start
+            metrics.update(call_metrics)
+            data.meta_info["ropd_metrics"] = metrics
 
         if self.score_offpolicy:
             for info in response_infos:
                 if not info["is_onpolicy"] and info["response_length"] > 0:
                     reward_tensor[info["batch_index"], info["response_length"] - 1] = self._rule_score(info)
 
+        section_start = time.perf_counter()
         self._write_debug(results)
+        if self.use_criterion_advantage and "ropd_metrics" in data.meta_info:
+            data.meta_info["ropd_metrics"]["timing_s/reward/write_debug"] = time.perf_counter() - section_start
         return reward_tensor
 
-    def _collect_criterion_metrics(self, results: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
-        criterion_values: Dict[str, Dict[str, List[float]]] = defaultdict(
-            lambda: {"judgements": [], "advantages": []}
+    def _should_defer_rcpc_interventions(self, skip_rcpc_credit: bool) -> bool:
+        return (
+            self.rcpc_enabled
+            and self.rcpc_intervention_enabled
+            and not skip_rcpc_credit
+            and self.rcpc_intervention_mode == "prefix_regen"
+            and self.rcpc_batch_counterfactual
         )
+
+    def _run_deferred_rcpc_interventions(
+        self,
+        groups: Sequence[Sequence[Dict[str, Any]]],
+        results: Sequence[Dict[str, Any]],
+    ) -> Dict[str, float]:
+        metrics: Dict[str, float] = {}
+        section_start = time.perf_counter()
+        plans = []
+        all_items = []
+        for group, result in zip(groups, results):
+            first = group[0]
+            if not first.get("deferred_rcpc_intervention", False):
+                continue
+            if not self.rcpc_enabled or not result.get("ok", False):
+                continue
+            candidates = result.get("rcpc_candidates") or []
+            if not candidates:
+                continue
+            try:
+                intervention_items = self._build_rcpc_intervention_items(
+                    first,
+                    group,
+                    result,
+                    candidates,
+                )
+            except Exception as exc:
+                result["rcpc_error"] = "{}: {}".format(type(exc).__name__, exc)
+                continue
+            if not intervention_items:
+                continue
+            plans.append(
+                {
+                    "first": first,
+                    "group": group,
+                    "result": result,
+                    "intervention_items": intervention_items,
+                }
+            )
+            all_items.extend(intervention_items)
+        metrics["timing_s/rcpc/build_intervention_plan_wall"] = time.perf_counter() - section_start
+        metrics["rcpc/intervention_plan_count"] = float(len(plans))
+        metrics["rcpc/intervention_item_count"] = float(len(all_items))
+        requested_samples = len(all_items) * self.rcpc_counterfactual_samples
+        metrics["rcpc/counterfactual_requested_samples"] = float(requested_samples)
+        if self.rcpc_counterfactual_batch_size > 0 and requested_samples > 0:
+            metrics["rcpc/counterfactual_generation_chunks"] = float(
+                (requested_samples + self.rcpc_counterfactual_batch_size - 1)
+                // self.rcpc_counterfactual_batch_size
+            )
+        else:
+            metrics["rcpc/counterfactual_generation_chunks"] = 1.0 if requested_samples else 0.0
+
+        if not plans:
+            return metrics
+
+        try:
+            section_start = time.perf_counter()
+            self._populate_counterfactual_texts(all_items)
+            metrics["timing_s/rcpc/counterfactual_generation_wall"] = time.perf_counter() - section_start
+        except Exception as exc:
+            error = "{}: {}".format(type(exc).__name__, exc)
+            for plan in plans:
+                plan["result"]["rcpc_error"] = error
+            return metrics
+
+        def finish_plan(plan: Mapping[str, Any]) -> None:
+            group = plan["group"]
+            result = plan["result"]
+            try:
+                section_start = time.perf_counter()
+                interventions = self._score_rcpc_intervention_items(
+                    plan["first"],
+                    group,
+                    result,
+                    plan["intervention_items"],
+                )
+                result["rcpc_interventions"] = interventions
+                token_advantages, metrics = self._build_rcpc_token_advantages(
+                    group,
+                    result,
+                    result.get("rcpc_candidates") or [],
+                    interventions,
+                )
+                metrics["rcpc/counterfactual_batched"] = 1.0
+                metrics["rcpc/counterfactual_items"] = float(len(plan["intervention_items"]))
+                metrics["rcpc/counterfactual_samples"] = float(self.rcpc_counterfactual_samples)
+                metrics["rcpc/counterfactual_batch_size"] = float(self.rcpc_counterfactual_batch_size)
+                metrics["timing_s/rcpc/intervention_score_group"] = time.perf_counter() - section_start
+                result["rcpc_token_advantages"] = token_advantages
+                result["rcpc_metrics"] = metrics
+            except Exception as exc:
+                result["rcpc_error"] = "{}: {}".format(type(exc).__name__, exc)
+
+        section_start = time.perf_counter()
+        if self.max_concurrency <= 1 or len(plans) <= 1:
+            for plan in plans:
+                finish_plan(plan)
+        else:
+            with ThreadPoolExecutor(max_workers=min(self.max_concurrency, len(plans))) as executor:
+                list(executor.map(finish_plan, plans))
+        metrics["timing_s/rcpc/intervention_score_wall"] = time.perf_counter() - section_start
+        return metrics
+
+    def _collect_criterion_metrics(self, results: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
         combined_advantages = []
+        format_valid_values = []
+        raw_scores = []
+        final_scores = []
+        ok_values = []
         for result in results:
+            ok_values.append(1.0 if result.get("ok", False) else 0.0)
+            format_valid_values.extend(
+                1.0 if value else 0.0 for value in result.get("student_format_valid", [])
+            )
+            raw_scores.extend(float(value) for value in result.get("student_scores", []))
+            scores = result.get("scores", {})
+            if isinstance(scores, Mapping):
+                final_scores.extend(float(value) for value in scores.values())
             combined_advantages.extend(float(value) for value in result.get("criterion_advantages", {}).values())
-            for criterion_id, stats in result.get("criterion_stats", {}).items():
-                criterion_values[str(criterion_id)]["judgements"].extend(
-                    float(value) for value in stats.get("judgements", [])
-                )
-                criterion_values[str(criterion_id)]["advantages"].extend(
-                    float(value) for value in stats.get("advantages", [])
-                )
 
         metrics = {
             "criterion_advantage/mean": (
@@ -545,20 +765,44 @@ class RopdIPRRewardScorer:
             ),
             "criterion_advantage/std": _population_std(combined_advantages),
         }
+        metrics.update(
+            {
+                "reward/group_ok_ratio": sum(ok_values) / len(ok_values) if ok_values else 0.0,
+                "reward/format_valid_ratio": (
+                    sum(format_valid_values) / len(format_valid_values) if format_valid_values else 0.0
+                ),
+                "reward/zero_score_on_format_error": 1.0 if self.zero_score_on_format_error else 0.0,
+                "reward/zero_criteria_on_format_error": 1.0 if self.zero_criteria_on_format_error else 0.0,
+                "reward/verifier_raw/mean": sum(raw_scores) / len(raw_scores) if raw_scores else 0.0,
+                "reward/verifier_raw/max": max(raw_scores) if raw_scores else 0.0,
+                "reward/verifier_raw/min": min(raw_scores) if raw_scores else 0.0,
+                "reward/final_nonzero_ratio": (
+                    sum(1.0 for value in final_scores if value != 0.0) / len(final_scores)
+                    if final_scores
+                    else 0.0
+                ),
+            }
+        )
         rcpc_metric_values: Dict[str, List[float]] = defaultdict(list)
+        timing_metric_values: Dict[str, List[float]] = defaultdict(list)
+        timing_count_values: Dict[str, List[float]] = defaultdict(list)
         for result in results:
             for key, value in result.get("rcpc_metrics", {}).items():
                 rcpc_metric_values[str(key)].append(float(value))
+            for key, value in result.get("timing_metrics", {}).items():
+                timing_metric_values[str(key)].append(float(value))
+            for key, value in result.get("timing_counts", {}).items():
+                timing_count_values[str(key)].append(float(value))
         for key, values in rcpc_metric_values.items():
             metrics[key] = sum(values) / len(values) if values else 0.0
-        for criterion_id, values in sorted(criterion_values.items()):
-            safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", criterion_id)
-            judgements = values["judgements"]
-            advantages = values["advantages"]
-            metrics["rubric/{}/pass_ratio".format(safe_id)] = (
-                sum(judgements) / len(judgements) if judgements else 0.0
-            )
-            metrics["rubric/{}/adv_std".format(safe_id)] = _population_std(advantages)
+        for key, values in timing_metric_values.items():
+            if not values:
+                continue
+            metrics[f"{key}/sum"] = sum(values)
+            metrics[f"{key}/mean"] = sum(values) / len(values)
+            metrics[f"{key}/max"] = max(values)
+        for key, values in timing_count_values.items():
+            metrics[f"timing_count/{key}"] = sum(values)
         return metrics
 
     def _has_training_group_keys(self, data: DataProto) -> bool:
@@ -575,6 +819,7 @@ class RopdIPRRewardScorer:
         uids = _as_list(data.non_tensor_batch.get("uid"))
         is_onpolicy_values = _as_list(data.non_tensor_batch.get("is_onpolicy"))
         raw_prompts = _as_list(data.non_tensor_batch.get("raw_prompt"))
+        raw_prompt_ids_values = _as_list(data.non_tensor_batch.get("raw_prompt_ids"))
         image_paths_values = _as_list(data.non_tensor_batch.get("image_paths"))
         answers = _as_list(data.non_tensor_batch.get("answer"))
 
@@ -601,6 +846,11 @@ class RopdIPRRewardScorer:
                     "uid": str(uids[batch_index]) if batch_index < len(uids) else "sample-{}".format(batch_index),
                     "is_onpolicy": bool(is_onpolicy_values[batch_index]) if batch_index < len(is_onpolicy_values) else True,
                     "raw_prompt": str(raw_prompt),
+                    "raw_prompt_ids": (
+                        [int(token_id) for token_id in _as_list(raw_prompt_ids_values[batch_index])]
+                        if batch_index < len(raw_prompt_ids_values)
+                        else []
+                    ),
                     "image_paths": [str(item) for item in _as_list(image_paths) if item],
                     "ground_truth": str(answers[batch_index]) if batch_index < len(answers) else "",
                     "response_text": response_text,
@@ -608,6 +858,7 @@ class RopdIPRRewardScorer:
                     "response_token_offsets": build_token_offsets(self.tokenizer, valid_response_ids),
                     "response_token_uncertainties": token_uncertainties,
                     "response_length": response_length,
+                    "global_step": int(getattr(self, "_current_global_step", -1)),
                 }
             )
         return infos
@@ -641,12 +892,18 @@ class RopdIPRRewardScorer:
         return grouped
 
     def _score_group(self, group: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        group_start = time.perf_counter()
+        timing_metrics: Dict[str, float] = {}
+        timing_counts: Dict[str, float] = {}
         first = group[0]
         raw_teacher_answers = []
         teacher_answers = []
         rubric = None
         try:
+            section_start = time.perf_counter()
             raw_teacher_answers = self._generate_teacher_answers(first)
+            timing_metrics["timing_s/reward/teacher_group"] = time.perf_counter() - section_start
+            timing_counts["teacher_requests"] = float(self.teacher_answer_count)
             teacher_answers = self._filter_teacher_answers(first, raw_teacher_answers)
             if not teacher_answers:
                 raw_teacher_labels = [
@@ -657,13 +914,20 @@ class RopdIPRRewardScorer:
                     "all teacher answers were filtered out by known final label; "
                     "ground_truth={}; raw_teacher_labels={}".format(first["ground_truth"], raw_teacher_labels)
                 )
+            section_start = time.perf_counter()
             rubric = self._generate_rubric(first, teacher_answers, [item["response_text"] for item in group])
+            timing_metrics["timing_s/reward/rubricator_group"] = time.perf_counter() - section_start
+            timing_counts["rubricator_requests"] = 1.0
             answer_items = self._build_shuffled_answer_items(
                 uid=first["uid"],
                 teacher_answers=teacher_answers,
                 student_answers=[item["response_text"] for item in group],
             )
+            section_start = time.perf_counter()
             verifier_payload = self._verify_answers(first, rubric, [item["text"] for item in answer_items])
+            timing_metrics["timing_s/reward/verifier_initial_group"] = time.perf_counter() - section_start
+            timing_counts["verifier_initial_requests"] = 1.0
+            timing_counts["verifier_initial_answers"] = float(len(answer_items))
             ordered_scores = [float(answer["final_score"]) for answer in verifier_payload["answers"]]
             student_scores = self._restore_student_scores(answer_items, ordered_scores, len(group))
             student_verifier_answers = self._restore_student_verifier_answers(
@@ -677,7 +941,7 @@ class RopdIPRRewardScorer:
                 _has_strict_cot_format(info["response_text"])
                 for info in group
             ]
-            if self.require_strict_cot_format:
+            if self.zero_score_on_format_error:
                 normalized_scores = [
                     score if student_format_valid[index] else 0.0
                     for index, score in enumerate(normalized_scores)
@@ -686,7 +950,7 @@ class RopdIPRRewardScorer:
                 rubric,
                 student_verifier_answers,
                 student_format_valid,
-                require_strict_cot_format=self.require_strict_cot_format,
+                require_strict_cot_format=self.zero_criteria_on_format_error,
             )
             scores = {
                 info["batch_index"]: normalized_scores[index]
@@ -717,13 +981,22 @@ class RopdIPRRewardScorer:
                 "rcpc_interventions": {},
                 "rcpc_token_advantages": {},
                 "rcpc_metrics": {},
+                "timing_metrics": timing_metrics,
+                "timing_counts": timing_counts,
                 "error": "",
             }
+            section_start = time.perf_counter()
             self._maybe_add_rcpc_credit(first, group, result)
+            timing_metrics["timing_s/rcpc/credit_prepare_group"] = time.perf_counter() - section_start
+            section_start = time.perf_counter()
             self._maybe_add_shadow_attribution(first, result)
-            self._maybe_print_group(first, result)
+            timing_metrics["timing_s/reward/shadow_attribution_group"] = time.perf_counter() - section_start
+            timing_metrics["timing_s/reward/group_total"] = time.perf_counter() - group_start
+            if not first.get("defer_group_print", False):
+                self._maybe_print_group(first, result)
             return result
         except Exception as exc:
+            timing_metrics["timing_s/reward/group_total"] = time.perf_counter() - group_start
             scores = {}
             for info in group:
                 scores[info["batch_index"]] = self._rule_score(info) if self.fallback_to_ipr else 0.0
@@ -756,9 +1029,12 @@ class RopdIPRRewardScorer:
                 "rcpc_interventions": {},
                 "rcpc_token_advantages": {},
                 "rcpc_metrics": {},
+                "timing_metrics": timing_metrics,
+                "timing_counts": timing_counts,
                 "error": "{}: {}".format(type(exc).__name__, exc),
             }
-            self._maybe_print_group(first, result)
+            if not first.get("defer_group_print", False):
+                self._maybe_print_group(first, result)
             return result
 
     def _maybe_add_rcpc_credit(
@@ -767,6 +1043,8 @@ class RopdIPRRewardScorer:
         group: Sequence[Dict[str, Any]],
         result: Dict[str, Any],
     ) -> None:
+        if first.get("skip_rcpc_credit", False):
+            return
         if not self.rcpc_enabled or not result.get("ok", False):
             return
         try:
@@ -810,53 +1088,206 @@ class RopdIPRRewardScorer:
         result: Mapping[str, Any],
         candidates: Sequence[Mapping[str, Any]],
     ) -> Dict[int, Dict[int, Dict[str, Any]]]:
+        intervention_items = self._build_rcpc_intervention_items(first, group, result, candidates)
+        if not intervention_items:
+            return {}
+        if self.rcpc_intervention_mode == "prefix_regen":
+            self._populate_counterfactual_texts(intervention_items)
+        return self._score_rcpc_intervention_items(first, group, result, intervention_items)
+
+    def _build_rcpc_intervention_items(
+        self,
+        first: Mapping[str, Any],
+        group: Sequence[Dict[str, Any]],
+        result: Mapping[str, Any],
+        candidates: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
         intervention_items = []
+        criterion_points = {
+            str(item["criterion_id"]): float(item["points"])
+            for item in result["rubric"]["rubrics"]
+        }
         for response_index, (info, candidate) in enumerate(zip(group, candidates)):
-            blocks = list(candidate.get("candidate_blocks", []))[: self.rcpc_intervention_max_blocks_per_answer]
-            for block in blocks:
-                intervention_items.append(
-                    {
-                        "response_index": response_index,
-                        "batch_index": info["batch_index"],
-                        "block_index": int(block["block_index"]),
-                        "block": block,
-                        "text": apply_intervention(
-                            str(info["response_text"]),
-                            block,
-                            mode=self.rcpc_intervention_mode,
-                        ),
-                    }
+            criterion_advantages = self._criterion_advantages_for_response(result, response_index)
+            point_total = sum(max(0.0, value) for value in criterion_points.values())
+            response_advantage_scale = 0.0
+            for criterion_id, points in criterion_points.items():
+                if points <= 0.0:
+                    continue
+                weight = points / point_total if point_total > 0.0 else 1.0
+                response_advantage_scale += weight * abs(float(criterion_advantages.get(criterion_id, 0.0)))
+            ranked_blocks = []
+            for block in candidate.get("candidate_blocks", []):
+                salience = max(
+                    0.0,
+                    float(block.get("block_max_robust_z", block.get("anchor_robust_z", 0.0))),
                 )
+                priority = response_advantage_scale * salience
+                if priority <= 0.0:
+                    continue
+                ranked_blocks.append(
+                    (
+                        priority,
+                        {
+                            **block,
+                            "selection_priority": priority,
+                        },
+                    )
+                )
+            ranked_blocks.sort(key=lambda item: item[0], reverse=True)
+            if self.rcpc_intervention_max_blocks_per_answer > 0:
+                ranked_blocks = ranked_blocks[: self.rcpc_intervention_max_blocks_per_answer]
+            blocks = [block for _, block in ranked_blocks]
+            for block in blocks:
+                item = {
+                    "response_index": response_index,
+                    "batch_index": info["batch_index"],
+                    "block_index": int(block["block_index"]),
+                    "block": block,
+                }
+                if self.rcpc_intervention_mode == "prefix_regen":
+                    prefix_token_end = max(0, int(block.get("token_start", 0)))
+                    prefix_response_token_ids = list(info.get("response_token_ids", []))[:prefix_token_end]
+                    if not info.get("raw_prompt_ids"):
+                        raise RuntimeError("prefix_regen requires raw_prompt_ids in the rollout batch")
+                    max_new_tokens = max(
+                        1,
+                        int(info.get("response_length", 0)) - len(prefix_response_token_ids),
+                    )
+                    item.update(
+                        {
+                            "raw_prompt_ids": list(info["raw_prompt_ids"]),
+                            "prefix_response_token_ids": prefix_response_token_ids,
+                            "max_new_tokens": max_new_tokens,
+                        }
+                    )
+                else:
+                    item["text"] = apply_intervention(
+                        str(info["response_text"]),
+                        block,
+                        mode=self.rcpc_intervention_mode,
+                    )
+                intervention_items.append(item)
+        intervention_items.sort(key=lambda item: float(item["block"].get("selection_priority", 0.0)), reverse=True)
+        if self.rcpc_intervention_max_blocks_per_group > 0:
+            intervention_items = intervention_items[: self.rcpc_intervention_max_blocks_per_group]
+        return intervention_items
+
+    def _populate_counterfactual_texts(self, intervention_items: Sequence[Dict[str, Any]]) -> None:
+        if self.rcpc_intervention_mode == "prefix_regen":
+            if self._counterfactual_generator is None:
+                raise RuntimeError("prefix_regen requires a counterfactual generator from the trainer")
+            samples = int(self.rcpc_counterfactual_samples)
+            expanded_items = []
+            for parent_index, item in enumerate(intervention_items):
+                for sample_index in range(samples):
+                    expanded_item = dict(item)
+                    expanded_item["_rcpc_parent_item_index"] = parent_index
+                    expanded_item["_rcpc_sample_index"] = sample_index
+                    expanded_items.append(expanded_item)
+            batch_size = int(self.rcpc_counterfactual_batch_size)
+            generated_answers = []
+            with self._counterfactual_lock:
+                if batch_size <= 0:
+                    generated_answers = self._counterfactual_generator(expanded_items)
+                else:
+                    for start in range(0, len(expanded_items), batch_size):
+                        chunk = expanded_items[start : start + batch_size]
+                        generated_answers.extend(self._counterfactual_generator(chunk))
+            if len(generated_answers) != len(expanded_items):
+                raise RuntimeError(
+                    "counterfactual generator returned {} answers for {} intervention items".format(
+                        len(generated_answers), len(expanded_items)
+                    )
+                )
+            texts_by_parent: Dict[int, List[str]] = defaultdict(list)
+            for expanded_item, generated_text in zip(expanded_items, generated_answers):
+                texts_by_parent[int(expanded_item["_rcpc_parent_item_index"])].append(str(generated_text))
+            for parent_index, item in enumerate(intervention_items):
+                texts = texts_by_parent.get(parent_index, [])
+                if len(texts) != samples:
+                    raise RuntimeError(
+                        "counterfactual generator produced {} samples for item {}, expected {}".format(
+                            len(texts), parent_index, samples
+                        )
+                    )
+                item["texts"] = texts
+                item["text"] = texts[0] if texts else ""
+                item["counterfactual_sample_count"] = len(texts)
+
+    def _score_rcpc_intervention_items(
+        self,
+        first: Mapping[str, Any],
+        group: Sequence[Dict[str, Any]],
+        result: Mapping[str, Any],
+        intervention_items: Sequence[Mapping[str, Any]],
+    ) -> Dict[int, Dict[int, Dict[str, Any]]]:
         if not intervention_items:
             return {}
 
+        flat_items = []
+        flat_texts = []
+        for item_index, item in enumerate(intervention_items):
+            texts = item.get("texts")
+            if not isinstance(texts, list) or not texts:
+                texts = [item.get("text", "")]
+            for sample_index, text in enumerate(texts):
+                flat_items.append((item_index, item, sample_index))
+                flat_texts.append(str(text))
         payload = self._verify_answers(
             dict(first),
             result["rubric"],
-            [item["text"] for item in intervention_items],
+            flat_texts,
         )
         original_answers = list(result["student_verifier_answers"])
         original_format_valid = list(result.get("student_format_valid", []))
         criterion_ids = [str(item["criterion_id"]) for item in result["rubric"]["rubrics"]]
+        answers_by_item: Dict[int, List[Mapping[str, Any]]] = defaultdict(list)
+        for (item_index, _item, _sample_index), intervened_answer in zip(flat_items, payload["answers"]):
+            answers_by_item[int(item_index)].append(intervened_answer)
         restored: Dict[int, Dict[int, Dict[str, Any]]] = defaultdict(dict)
-        for item, intervened_answer in zip(intervention_items, payload["answers"]):
+        for item_index, item in enumerate(intervention_items):
+            intervened_answers = answers_by_item.get(item_index, [])
+            if not intervened_answers:
+                continue
             response_index = int(item["response_index"])
             original = original_answers[response_index]
             criterion_effects = {}
             for criterion_index, criterion_id in enumerate(criterion_ids):
                 original_judgement = bool(original["judgement"][criterion_index])
-                if self.require_strict_cot_format and not original_format_valid[response_index]:
+                if self.zero_criteria_on_format_error and not original_format_valid[response_index]:
                     original_judgement = False
-                intervened_judgement = bool(intervened_answer["judgement"][criterion_index])
+                intervened_values = [
+                    1.0 if bool(answer["judgement"][criterion_index]) else 0.0
+                    for answer in intervened_answers
+                ]
+                mean_intervened_value = (
+                    sum(intervened_values) / len(intervened_values) if intervened_values else 0.0
+                )
                 criterion_effects[criterion_id] = (
                     (1.0 if original_judgement else 0.0)
-                    - (1.0 if intervened_judgement else 0.0)
+                    - mean_intervened_value
                 )
+            intervened_scores = [float(answer["final_score"]) for answer in intervened_answers]
+            mean_intervened_score = (
+                sum(intervened_scores) / len(intervened_scores) if intervened_scores else 0.0
+            )
+            intervened_texts = item.get("texts")
+            if not isinstance(intervened_texts, list) or not intervened_texts:
+                intervened_texts = [str(item.get("text", ""))]
             restored[item["batch_index"]][int(item["block_index"])] = {
+                "response_index": response_index,
+                "batch_index": int(item["batch_index"]),
+                "block_index": int(item["block_index"]),
+                "block": item["block"],
+                "intervened_text": str(item.get("text", "")),
+                "intervened_texts": [str(text) for text in intervened_texts],
+                "counterfactual_sample_count": len(intervened_answers),
                 "criterion_effects": criterion_effects,
                 "original_score": float(original["final_score"]),
-                "intervened_score": float(intervened_answer["final_score"]),
-                "score_effect": float(original["final_score"]) - float(intervened_answer["final_score"]),
+                "intervened_score": mean_intervened_score,
+                "intervened_scores": intervened_scores,
+                "score_effect": float(original["final_score"]) - mean_intervened_score,
             }
         return {int(batch_index): dict(value) for batch_index, value in restored.items()}
 
@@ -895,6 +1326,8 @@ class RopdIPRRewardScorer:
                 criterion_points=criterion_points,
                 intervention_effects=interventions.get(batch_index),
                 fallback_to_full_response=self.rcpc_fallback_to_criterion_advantage,
+                transport_lambda=self.rcpc_transport_lambda,
+                effect_noise_floor=self.rcpc_effect_noise_floor,
             )
             token_advantages[batch_index] = values
             for key, value in metrics.items():
@@ -909,6 +1342,8 @@ class RopdIPRRewardScorer:
         return token_advantages, metrics
 
     def _generate_teacher_answers(self, info: Dict[str, Any]) -> List[str]:
+        if self.teacher_template is None:
+            raise FileNotFoundError("Missing teacher.txt prompt for dynamic ROPD reward.")
         prompt = _render_template(
             self.teacher_template,
             {
@@ -959,6 +1394,8 @@ class RopdIPRRewardScorer:
         teacher_answers: Sequence[str],
         student_answers: Sequence[str],
     ) -> Dict[str, Any]:
+        if self.rubricator_template is None:
+            raise FileNotFoundError("Missing rubricator.txt prompt for dynamic ROPD reward.")
         ground_truth = info["ground_truth"] if self.include_ground_truth else "N/A"
         prompt = _render_template(
             self.rubricator_template,
@@ -1232,6 +1669,7 @@ class RopdIPRRewardScorer:
             r"output\s+protocol",
             r"\bformat\b",
             r"tag",
+            r"<reasoning>",
             r"<think>",
             r"格式",
             r"标签格式",
@@ -1346,70 +1784,188 @@ class RopdIPRRewardScorer:
         return float(ipr_compute_score(str(info["response_text"]), str(info["ground_truth"])))
 
     def _maybe_print_group(self, first_info: Mapping[str, Any], result: Mapping[str, Any]) -> None:
-        if self.already_print >= self.num_examine:
-            return
-        self.already_print += 1
-        image_paths = first_info.get("image_paths") or []
-        print("[ropd uid]", first_info["uid"])
-        print("[ropd question]", first_info["raw_prompt"])
-        print("[ropd image_count]", len(image_paths))
-        print("[ropd teacher_usable_image_count]", self.client.count_usable_image_paths(image_paths))
-        skipped_images = self.client.skipped_image_paths(image_paths)
-        if skipped_images:
-            print("[ropd skipped_images_sample]", skipped_images)
-        print("[ropd ground_truth]", first_info["ground_truth"])
-        print("[ropd ok]", result["ok"])
-        print("[ropd scores]", result["scores"])
-        if result.get("criterion_advantages"):
-            print("[ropd criterion advantages]", result["criterion_advantages"])
-        if self.print_rcpc_outputs and result.get("rcpc_candidates"):
-            print("[ropd rcpc metrics]", json.dumps(result.get("rcpc_metrics", {}), ensure_ascii=False))
-            print("[ropd rcpc candidates]")
-            print(json.dumps(result["rcpc_candidates"], ensure_ascii=False, indent=2)[:20000])
-        if self.print_rcpc_outputs and result.get("rcpc_interventions"):
-            print("[ropd rcpc interventions]")
-            print(json.dumps(result["rcpc_interventions"], ensure_ascii=False, indent=2)[:20000])
-        if result.get("rcpc_error"):
-            print("[ropd rcpc error]", result["rcpc_error"])
-        if self.print_rubric_outputs and result.get("rubric"):
-            print("[ropd rubric]")
-            print(json.dumps(result["rubric"], ensure_ascii=False, indent=2))
-        if self.print_shadow_attributions and result.get("shadow_attribution"):
-            print("[ropd shadow attribution]")
-            print(json.dumps(result["shadow_attribution"], ensure_ascii=False, indent=2))
-        if result.get("shadow_attribution_error"):
-            print("[ropd shadow attribution error]", result["shadow_attribution_error"])
-        if self.print_teacher_outputs:
-            raw_teacher_answers = result.get("raw_teacher_answers") or result.get("teacher_answers") or []
-            for index, answer in enumerate(raw_teacher_answers, start=1):
-                print("[ropd teacher raw answer {}]".format(index))
-                print(answer)
-            filtered_teacher_answers = result.get("teacher_answers") or []
-            if raw_teacher_answers and filtered_teacher_answers != raw_teacher_answers:
-                for index, answer in enumerate(filtered_teacher_answers, start=1):
-                    print("[ropd teacher kept answer {}]".format(index))
+        with self._print_lock:
+            self._maybe_print_rcpc_intervention_summary_locked(first_info, result)
+            if self.already_print >= self.num_examine:
+                return
+            self.already_print += 1
+            image_paths = first_info.get("image_paths") or []
+            print("[ropd uid]", first_info["uid"])
+            print("[ropd question]", first_info["raw_prompt"])
+            print("[ropd image_count]", len(image_paths))
+            print("[ropd teacher_usable_image_count]", self.client.count_usable_image_paths(image_paths))
+            skipped_images = self.client.skipped_image_paths(image_paths)
+            if skipped_images:
+                print("[ropd skipped_images_sample]", skipped_images)
+            print("[ropd ground_truth]", first_info["ground_truth"])
+            print("[ropd ok]", result["ok"])
+            print("[ropd scores]", result["scores"])
+            if result.get("criterion_advantages"):
+                print("[ropd criterion advantages]", result["criterion_advantages"])
+            if self.print_rcpc_outputs and result.get("rcpc_candidates"):
+                print("[ropd rcpc metrics]", json.dumps(result.get("rcpc_metrics", {}), ensure_ascii=False))
+                print("[ropd rcpc candidates]")
+                print(json.dumps(result["rcpc_candidates"], ensure_ascii=False, indent=2)[:20000])
+            if self.print_rcpc_outputs and result.get("rcpc_interventions"):
+                print("[ropd rcpc interventions]")
+                print(json.dumps(result["rcpc_interventions"], ensure_ascii=False, indent=2)[:20000])
+            if result.get("rcpc_error"):
+                print("[ropd rcpc error]", result["rcpc_error"])
+            if self.print_rubric_outputs and result.get("rubric"):
+                print("[ropd rubric]")
+                print(json.dumps(result["rubric"], ensure_ascii=False, indent=2))
+            if self.print_shadow_attributions and result.get("shadow_attribution"):
+                print("[ropd shadow attribution]")
+                print(json.dumps(result["shadow_attribution"], ensure_ascii=False, indent=2))
+            if result.get("shadow_attribution_error"):
+                print("[ropd shadow attribution error]", result["shadow_attribution_error"])
+            if self.print_teacher_outputs:
+                raw_teacher_answers = result.get("raw_teacher_answers") or result.get("teacher_answers") or []
+                for index, answer in enumerate(raw_teacher_answers, start=1):
+                    print("[ropd teacher raw answer {}]".format(index))
                     print(answer)
-        if self.print_student_outputs:
-            student_answers = result.get("student_answers") or []
-            student_batch_indices = result.get("student_batch_indices") or list(range(len(student_answers)))
-            scores = result.get("scores") or {}
-            for index, answer in enumerate(student_answers, start=1):
-                batch_index = student_batch_indices[index - 1] if index - 1 < len(student_batch_indices) else index - 1
-                if isinstance(scores, Mapping):
-                    score_value = scores.get(batch_index, "N/A")
-                else:
-                    score_value = "N/A"
-                format_valid = result.get("student_format_valid") or []
-                format_value = format_valid[index - 1] if index - 1 < len(format_valid) else "N/A"
-                print("[ropd student answer {} score={} format_valid={}]".format(index, score_value, format_value))
-                print(answer)
-                if self.print_verifier_outputs:
-                    verifier_answers = result.get("student_verifier_answers") or []
-                    if index - 1 < len(verifier_answers):
-                        print("[ropd student verifier {}]".format(index))
-                        print(json.dumps(verifier_answers[index - 1], ensure_ascii=False))
-        if result.get("error"):
-            print("[ropd error]", result["error"])
+                filtered_teacher_answers = result.get("teacher_answers") or []
+                if raw_teacher_answers and filtered_teacher_answers != raw_teacher_answers:
+                    for index, answer in enumerate(filtered_teacher_answers, start=1):
+                        print("[ropd teacher kept answer {}]".format(index))
+                        print(answer)
+            if self.print_student_outputs:
+                student_answers = result.get("student_answers") or []
+                student_batch_indices = result.get("student_batch_indices") or list(range(len(student_answers)))
+                scores = result.get("scores") or {}
+                max_student_outputs = self.print_max_student_outputs
+                if max_student_outputs > 0:
+                    student_answers = student_answers[:max_student_outputs]
+                for index, answer in enumerate(student_answers, start=1):
+                    batch_index = student_batch_indices[index - 1] if index - 1 < len(student_batch_indices) else index - 1
+                    if isinstance(scores, Mapping):
+                        score_value = scores.get(batch_index, "N/A")
+                    else:
+                        score_value = "N/A"
+                    format_valid = result.get("student_format_valid") or []
+                    format_value = format_valid[index - 1] if index - 1 < len(format_valid) else "N/A"
+                    print(
+                        "[ropd student answer {} score={} format_valid={} chars={} "
+                        "has_<reasoning>={} has_</reasoning>={} has_<answer>={} has_</answer>={} "
+                        "has_legacy_<think>={}]".format(
+                            index,
+                            score_value,
+                            format_value,
+                            len(str(answer)),
+                            "<reasoning>" in str(answer).lower(),
+                            "</reasoning>" in str(answer).lower(),
+                            "<answer>" in str(answer).lower(),
+                            "</answer>" in str(answer).lower(),
+                            "<think>" in str(answer).lower(),
+                        )
+                    )
+                    print(answer)
+                    if self.print_verifier_outputs:
+                        verifier_answers = result.get("student_verifier_answers") or []
+                        if index - 1 < len(verifier_answers):
+                            print("[ropd student verifier {}]".format(index))
+                            print(json.dumps(verifier_answers[index - 1], ensure_ascii=False))
+            if result.get("error"):
+                print("[ropd error]", result["error"])
+
+    def _maybe_print_rcpc_intervention_summary_locked(
+        self,
+        first_info: Mapping[str, Any],
+        result: Mapping[str, Any],
+    ) -> None:
+        if not self.rcpc_print_intervention_summary:
+            return
+        interventions = result.get("rcpc_interventions") or {}
+        if not interventions:
+            return
+        step = int(first_info.get("global_step", getattr(self, "_current_global_step", -1)))
+        if step <= 0:
+            return
+        interval = int(self.rcpc_print_interval)
+        if step != 1 and (interval <= 0 or step % interval != 0):
+            return
+        printed = self._rcpc_summary_printed_by_step.get(step, 0)
+        if self.rcpc_print_max_groups >= 0 and printed >= self.rcpc_print_max_groups:
+            return
+        self._rcpc_summary_printed_by_step[step] = printed + 1
+
+        max_blocks = int(self.rcpc_print_max_blocks)
+        student_answers = result.get("student_answers") or []
+        student_batch_indices = result.get("student_batch_indices") or list(range(len(student_answers)))
+        batch_to_answer = {
+            int(batch_index): str(student_answers[index])
+            for index, batch_index in enumerate(student_batch_indices)
+            if index < len(student_answers)
+        }
+        trajectory_items = []
+        emitted_blocks = 0
+        for batch_index, block_map in sorted(interventions.items(), key=lambda item: int(item[0])):
+            blocks = []
+            for block_index, payload in sorted(block_map.items(), key=lambda item: int(item[0])):
+                if max_blocks >= 0 and emitted_blocks >= max_blocks:
+                    break
+                block = payload.get("block", {}) or {}
+                blocks.append(
+                    {
+                        "block_index": int(block_index),
+                        "response_index": int(payload.get("response_index", -1)),
+                        "action_ids": block.get("action_ids", []),
+                        "token_start": int(block.get("token_start", -1)),
+                        "token_end": int(block.get("token_end", -1)),
+                        "selection_priority": float(block.get("selection_priority", 0.0)),
+                        "anchor_robust_z": float(block.get("anchor_robust_z", 0.0)),
+                        "block_mean_robust_z": float(block.get("block_mean_robust_z", 0.0)),
+                        "text": str(block.get("text", "")),
+                        "intervened_text_preview": str(payload.get("intervened_text", ""))[:1200],
+                        "counterfactual_sample_count": int(payload.get("counterfactual_sample_count", 1)),
+                        "intervened_scores": payload.get("intervened_scores", []),
+                        "criterion_effects": payload.get("criterion_effects", {}),
+                        "calibrated_effects": payload.get("calibrated_effects", {}),
+                        "score_effect": float(payload.get("score_effect", 0.0)),
+                        "original_score": float(payload.get("original_score", 0.0)),
+                        "intervened_score": float(payload.get("intervened_score", 0.0)),
+                    }
+                )
+                emitted_blocks += 1
+            if blocks:
+                answer_text = batch_to_answer.get(int(batch_index), "")
+                trajectory_items.append(
+                    {
+                        "batch_index": int(batch_index),
+                        "trajectory_preview": answer_text[:1200],
+                        "blocks": blocks,
+                    }
+                )
+            if max_blocks >= 0 and emitted_blocks >= max_blocks:
+                break
+
+        payload = {
+            "step": step,
+            "uid": first_info.get("uid", ""),
+            "budget": {
+                "B_group": self.rcpc_budget,
+                "derive_candidates_from_budget": self.rcpc_derive_candidates_from_budget,
+                "effective_top_actions": self.rcpc_top_actions,
+                "effective_top_blocks": self.rcpc_top_blocks,
+                "groups_per_batch": self.rcpc_intervention_max_groups_per_batch,
+                "blocks_per_answer": self.rcpc_intervention_max_blocks_per_answer,
+                "blocks_per_group": self.rcpc_intervention_max_blocks_per_group,
+                "counterfactual_samples": self.rcpc_counterfactual_samples,
+                "counterfactual_batch_size": self.rcpc_counterfactual_batch_size,
+                "print_max_groups": self.rcpc_print_max_groups,
+                "print_max_blocks": self.rcpc_print_max_blocks,
+            },
+            "transport": {
+                "lambda": self.rcpc_transport_lambda,
+                "effect_noise_floor": self.rcpc_effect_noise_floor,
+            },
+            "scores": result.get("scores", {}),
+            "criterion_advantages": result.get("criterion_advantages", {}),
+            "rcpc_metrics": result.get("rcpc_metrics", {}),
+            "trajectories": trajectory_items,
+        }
+        print("[ropd rcpc intervention summary]")
+        print(json.dumps(payload, ensure_ascii=False, indent=2)[:30000])
 
     def _write_debug(self, results: Iterable[Mapping[str, Any]]) -> None:
         if self.debug_path is None:

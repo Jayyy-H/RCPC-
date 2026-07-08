@@ -249,68 +249,18 @@ class DataParallelPPOActor(BasePPOActor):
             # TODO (yaowei): preprocess data for padding_free and ulysses
             raise NotImplementedError
         else:
-            if self.actor_module.config.model_type == "valley":                
-                attention_mask_copy = attention_mask.clone()
-                attention_mask_copy[:, -response_length:] = True
-                self.actor_module.right_padding = False
-                output = self.actor_module(
-                    input_ids=input_ids.to(device="cuda"),
-                    attention_mask=attention_mask_copy.to(device="cuda"),
-                    # position_ids=position_ids, 
-                    **vision_inputs,
-                    use_cache=False,
-                )
-                self.actor_module.right_padding = None
-                logits: torch.Tensor = output.logits
-                logits.div_(temperature)
-                logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
-                log_probs = logprobs_from_logits(logits, responses)  # (bsz, response_length)
-                entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
-                
-            else:
-                output = self.actor_module(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    **vision_inputs,
-                    use_cache=False,
-                )
-                logits: torch.Tensor = output.logits
-                logits.div_(temperature)
-                logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
-
-                def safe_logprobs(_logits, _targets):
-                    if _logits.numel() == 0:
-                        return _logits.new_zeros((0, response_length))
-                    return logprobs_from_logits(_logits, _targets)
-
-                def safe_entropy(_logits):
-                    if _logits.numel() == 0:
-                        return _logits.new_zeros((0, response_length))
-                    return verl_F.entropy_from_logits(_logits)       
-
-                # if self.in_update:
-                #     is_onpolicy = micro_batch["is_onpolicy"] # (bs, 1)
-                #     # 统一的 on/off 划分逻辑
-                #     on_mask = is_onpolicy.view(-1).to(dtype=torch.bool, device=logits.device)
-                #     off_mask = ~on_mask
-                #     bs = logits.size(0)
-                #     logits_on = logits[on_mask, :, :] if on_mask.any() else logits.new_zeros((0, response_length, logits.size(-1)))
-                #     logits_off = logits[off_mask, :, :] if off_mask.any() else logits.new_zeros((0, response_length, logits.size(-1)))
-                #     responses_on = responses[on_mask, :] if on_mask.any() else responses.new_zeros((0, response_length))
-                #     responses_off = responses[off_mask, :] if off_mask.any() else responses.new_zeros((0, response_length))
-
-                #     # 只用 on 计算 entropy
-                #     entropy = safe_entropy(logits_on)
-
-                #     # 分别计算 log_probs
-                #     log_probs_on = safe_logprobs(logits_on, responses_on)
-                #     log_probs_off = safe_logprobs(logits_off, responses_off)
-
-                #     return entropy, log_probs_on, log_probs_off
-
-                log_probs = logprobs_from_logits(logits, responses)  # (bsz, response_length)
-                entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+            output = self.actor_module(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                **vision_inputs,
+                use_cache=False,
+            )
+            logits: torch.Tensor = output.logits
+            logits.div_(temperature)
+            logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+            log_probs = logprobs_from_logits(logits, responses)  # (bsz, response_length)
+            entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
         return entropy, log_probs
 

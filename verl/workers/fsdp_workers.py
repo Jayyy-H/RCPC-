@@ -55,9 +55,8 @@ from verl.utils.torch_functional import get_constant_schedule_with_warmup
 from verl.workers.actor import DataParallelPPOActor
 from verl.workers.config import FSDPConfig, ModelConfig, OptimConfig, WorkerConfig
 from verl.workers.critic import DataParallelPPOCritic
-from verl.workers.rollout.vllm_rollout import vLLMRollout, vLLMRolloutValley
-from verl.workers.rollout.hf_rollout_valley import HFRolloutValley
-from verl.workers.sharding_manager import FSDPVLLMShardingManager, BaseShardingManager
+from verl.workers.rollout.vllm_rollout import vLLMRollout
+from verl.workers.sharding_manager import FSDPVLLMShardingManager
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
 
@@ -318,50 +317,8 @@ class FSDPWorker(Worker):
                 device_mesh=rollout_device_mesh,
             )
             log_gpu_memory_usage("After building sharding manager")
-        elif self.config.rollout.name == "hf_valley":
-            log_gpu_memory_usage("Before building hf_valley rollout")
-            self.rollout = HFRolloutValley(
-                module=self.fsdp_module,
-                config=self.config.rollout,
-                tokenizer=self.tokenizer,
-            )
-            log_gpu_memory_usage("After building hf_valley rollout")
-
-            self.rollout_sharding_manager = BaseShardingManager()
-            log_gpu_memory_usage("After building sharding manager")
-        elif self.config.rollout.name == "vllm_valley":
-            # TODO(sgm): support FSDP hybrid shard for larger model
-            tp_size = self.config.rollout.tensor_parallel_size
-            dp_size = self.world_size // tp_size
-            assert self.world_size % tp_size == 0, (
-                f"rollout world_size: {self.world_size} is not divisible by tp_size: {tp_size}"
-            )
-            rollout_device_mesh = init_device_mesh("cuda", mesh_shape=(dp_size, tp_size), mesh_dim_names=["dp", "tp"])
-            log_gpu_memory_usage("Before building vllm rollout")
-            self.rollout = vLLMRolloutValley(
-                model_path=self.config.actor.model.model_path,
-                config=self.config.rollout,
-                tokenizer=self.tokenizer,
-            )
-            log_gpu_memory_usage("After building vllm rollout")
-
-            self.rollout_sharding_manager = FSDPVLLMShardingManager(
-                module=self.fsdp_module,
-                inference_engine=self.rollout.inference_engine,
-                device_mesh=rollout_device_mesh,
-            )
-            log_gpu_memory_usage("After building sharding manager")
-        elif self.config.rollout.name == "hf_valley":
-            log_gpu_memory_usage("Before building hf_valley rollout")
-            self.rollout = HFRolloutValley(
-                module=self.fsdp_module,
-                config=self.config.rollout,
-                tokenizer=self.tokenizer,
-            )
-            log_gpu_memory_usage("After building hf_valley rollout")
-
-            self.rollout_sharding_manager = BaseShardingManager()
-            log_gpu_memory_usage("After building sharding manager")
+        else:
+            raise NotImplementedError(f"Unsupported rollout backend: {self.config.rollout.name}")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -489,7 +446,7 @@ class FSDPWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def generate_sequences(self, prompts: DataProto):
+    def generate_sequences(self, prompts: DataProto, **kwargs):
         assert self._is_rollout
 
         if self._use_param_offload:
@@ -515,7 +472,7 @@ class FSDPWorker(Worker):
             log_gpu_memory_usage("After entering rollout sharding manager")
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            output = self.rollout.generate_sequences(prompts=prompts)
+            output = self.rollout.generate_sequences(prompts=prompts, **kwargs)
             log_gpu_memory_usage("After rollout generation")
 
             output = self.rollout_sharding_manager.postprocess_data(output)
@@ -526,7 +483,7 @@ class FSDPWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def generate_sequences_val(self, prompts: DataProto):
+    def generate_sequences_val(self, prompts: DataProto, **kwargs):
         assert self._is_rollout
 
         if self._use_param_offload:
@@ -552,7 +509,7 @@ class FSDPWorker(Worker):
             log_gpu_memory_usage("After entering rollout sharding manager")
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            output = self.rollout.generate_sequences_val(prompts=prompts)
+            output = self.rollout.generate_sequences_val(prompts=prompts, **kwargs)
             log_gpu_memory_usage("After rollout generation")
 
             output = self.rollout_sharding_manager.postprocess_data(output)

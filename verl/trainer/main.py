@@ -31,10 +31,10 @@ from verl.workers.reward import CustomRewardManager
 
 def _ray_runtime_env_vars():
     names = (
-        "GPT5_4_API_KEY",
-        "GPT5_4_BASE_URL",
-        "OPENAI_API_KEY",
-        "OPENAI_BASE_URL",
+        "JUDGE_API_KEY",
+        "JUDGE_BASE_URL",
+        "JUDGE_MODEL",
+        "JUDGE_API_STYLE",
         "ROPD_MODEL",
         "ROPD_TEACHER_MODEL",
         "ROPD_RUBRICATOR_MODEL",

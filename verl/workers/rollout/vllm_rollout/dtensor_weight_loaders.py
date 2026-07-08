@@ -188,55 +188,6 @@ def qwen2vl_dtensor_weight_loader(actor_weights: Dict[str, torch.Tensor], vllm_m
             weight_loader = getattr(vllm_param, "weight_loader", default_weight_loader)
             weight_loader(vllm_param, local_actor_weight.to(dtype=vllm_param.dtype))
 
-def valley_dtensor_weight_loader(actor_weights: Dict[str, torch.Tensor], vllm_model: nn.Module) -> nn.Module:
-    ### WARNING: Only support Valley_B7v3
-    stacked_params_mapping = [
-        # (vllm_substr, hf_substr, shard_id)
-        ("qkv_proj", "q_proj", "q"),
-        ("qkv_proj", "k_proj", "k"),
-        ("qkv_proj", "v_proj", "v"),
-        ("gate_up_proj", "gate_proj", 0),
-        ("gate_up_proj", "up_proj", 1),
-    ]
-    vllm_params = dict(vllm_model.named_parameters(remove_duplicate=False))
-    for actor_name, actor_weight in actor_weights.items():
-        if "rotary_emb.inv_freq" in actor_name:
-            continue
-
-        if vllm_model.config.tie_word_embeddings and "lm_head.weight" in actor_name:
-            continue
-
-        for vllm_substr, hf_substr, shard_id in stacked_params_mapping:
-            if hf_substr not in actor_name:
-                continue
-
-            if "qwen2vl_vision_tower" in actor_name:
-                continue
-
-            vllm_name = "language_model." + actor_name.replace(hf_substr, vllm_substr)
-            if actor_name.endswith(".bias") and actor_name not in vllm_params:
-                continue  # skip loading extra bias for GPTQ models
-
-            local_actor_weight = redistribute_dtensor(param_name=actor_name, loaded_weights=actor_weight)
-            vllm_param = vllm_params[vllm_name]
-            weight_loader = vllm_param.weight_loader
-            weight_loader(vllm_param, local_actor_weight.to(dtype=vllm_param.dtype), shard_id)
-            break
-        else:
-            if actor_name.endswith(".bias") and actor_name not in vllm_params:
-                continue  # skip loading extra bias for GPTQ models
-
-            if "qwen2vl_vision_tower" in actor_name:
-                vllm_name = actor_name.replace("model.qwen2vl_vision_tower", "visual")
-            else:
-                vllm_name = "language_model." + actor_name
-
-            vllm_param = vllm_params[vllm_name]
-            local_actor_weight = redistribute_dtensor(param_name=actor_name, loaded_weights=actor_weight)
-            weight_loader = getattr(vllm_param, "weight_loader", default_weight_loader)
-            weight_loader(vllm_param, local_actor_weight.to(dtype=vllm_param.dtype))
-
-
 def deepseekv2_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> nn.Module:
     stacked_params_mapping = [
         # (param_name, shard_name, shard_id)
@@ -364,7 +315,6 @@ __MODEL_DTENSOR_WEIGHT_LOADER_REGISTRY__ = {
     "DeepseekV2ForCausalLM": deepseekv2_dtensor_weight_loader,
     "Qwen2VLForConditionalGeneration": qwen2vl_dtensor_weight_loader,
     "Qwen2_5_VLForConditionalGeneration": qwen2vl_dtensor_weight_loader,
-    "ValleyQwen2ForCausalLM": valley_dtensor_weight_loader
 }
 
 

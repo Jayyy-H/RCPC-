@@ -15,6 +15,7 @@
 import math
 import os
 import random
+import re
 import traceback
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
@@ -29,6 +30,10 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 
 import verl.utils.torch_functional as verl_F
 from verl.models.transformers.qwen2_5_vl import get_rope_index
+
+
+_THINK_OPEN_RE = re.compile(r"<\s*think\s*>", re.IGNORECASE)
+_THINK_CLOSE_RE = re.compile(r"</\s*think\s*>", re.IGNORECASE)
 
 
 def collate_fn(features: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -77,6 +82,85 @@ def _env_int(name: str, default: int) -> int:
         return max(1, int(os.getenv(name, str(default))))
     except ValueError:
         return default
+
+
+def _first_nonempty(row_dict: Dict[str, Any], keys: List[str]) -> str:
+    for key in keys:
+        value = row_dict.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            value = str(value)
+        value = value.strip()
+        if value:
+            return value
+    return ""
+
+
+def _format_webinstruct_prompt(row_dict: Dict[str, Any], prompt_key: str) -> str:
+    prompt = _first_nonempty(row_dict, [prompt_key, "problem", "prompt", "instruction", "input"])
+    if prompt:
+        return prompt
+
+    parts = []
+    metadata = []
+    discipline = _first_nonempty(row_dict, ["discipline"])
+    difficulty = _first_nonempty(row_dict, ["difficulty"])
+    task_type = _first_nonempty(row_dict, ["type", "question_type"])
+    if discipline:
+        metadata.append(f"Discipline: {discipline}")
+    if difficulty:
+        metadata.append(f"Difficulty: {difficulty}")
+    if task_type:
+        metadata.append(f"Type: {task_type}")
+    if metadata:
+        parts.append("\n".join(metadata))
+
+    original_document = _first_nonempty(row_dict, ["original_document", "document", "context"])
+    design_logic = _first_nonempty(row_dict, ["design_logic"])
+    question = _first_nonempty(row_dict, ["question", "query"])
+    if original_document:
+        parts.append(f"[Context]\n{original_document}")
+    if design_logic:
+        parts.append(f"[Design Logic]\n{design_logic}")
+    if question:
+        parts.append(f"[Question]\n{question}")
+    if not parts:
+        raise KeyError(f"missing prompt field {prompt_key!r} and WebInstruct fallback fields")
+    return "\n\n".join(parts).strip()
+
+
+def _format_sft_target(row_dict: Dict[str, Any], target_key: str) -> str:
+    target = _first_nonempty(
+        row_dict,
+        [target_key, "solution", "cot_solution", "cot", "reasoning", "response", "assistant_response", "output"],
+    )
+    if not target:
+        raise KeyError(f"missing target field {target_key!r} and target fallback fields")
+    target = _THINK_OPEN_RE.sub("<reasoning>", target)
+    target = _THINK_CLOSE_RE.sub("</reasoning>", target)
+    lower = target.lower()
+    if _env_flag("ROPD_WRAP_UNTAGGED_TARGET", True) and "<reasoning>" not in lower:
+        answer = _first_nonempty(row_dict, ["answer", "final_answer", "reference_answer"])
+        if answer and "<answer>" not in lower:
+            return f"<reasoning>{target.strip()}</reasoning><answer>{answer}</answer>"
+        return f"<reasoning>{target.strip()}</reasoning>"
+    answer = _first_nonempty(row_dict, ["answer", "final_answer", "reference_answer"])
+    if answer and "<answer>" not in lower:
+        return target.rstrip() + f"<answer>{answer}</answer>"
+    return target
+
+
+def _apply_chat_template_no_thinking(tokenizer: PreTrainedTokenizer, messages: List[Dict[str, str]]) -> str:
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+            enable_thinking=False,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
 
 
 def _check_qwen_image_prompt(
@@ -171,9 +255,11 @@ class SFTRLDataset(Dataset):
 
     def _build_item(self, index):
         row_dict = dict(self.dataset[index])
+        prompt_text = _format_webinstruct_prompt(row_dict, self.prompt_key)
+        target_text = _format_sft_target(row_dict, self.target_key)
 
-        messages = [{"role": "user", "content": row_dict[self.prompt_key]}]
-        prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        messages = [{"role": "user", "content": prompt_text}]
+        prompt = _apply_chat_template_no_thinking(self.tokenizer, messages)
 
         if "image" in row_dict:
             row_dict["images"] = row_dict["image"]
@@ -251,7 +337,7 @@ class SFTRLDataset(Dataset):
         else:
             position_ids = torch.clip(attention_mask.cumsum(dim=0) - 1, min=0, max=None)
 
-        target_ids = self.tokenizer.encode(row_dict[self.target_key], add_special_tokens=False)
+        target_ids = self.tokenizer.encode(target_text, add_special_tokens=False)
         if isinstance(target_ids, torch.Tensor):
             target_ids = target_ids.tolist()
         elif isinstance(target_ids, np.ndarray):
@@ -268,8 +354,8 @@ class SFTRLDataset(Dataset):
         row_dict["attention_mask"] = attention_mask
         row_dict["position_ids"] = position_ids
         row_dict["raw_prompt_ids"] = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
-        row_dict["raw_prompt"] = row_dict[self.prompt_key]
+        row_dict["raw_prompt"] = prompt_text
         row_dict["image_paths"] = image_paths
         row_dict["target_ids"] = target_ids
-        row_dict["answer"] = row_dict.get("answer", "")
+        row_dict["answer"] = _first_nonempty(row_dict, ["answer", "final_answer", "reference_answer"])
         return row_dict

@@ -1,14 +1,53 @@
-# SFTRL联合训练（preview）
-目前仅支持valleyb7v3的SFT+RL训练，qwen等开源模型未来会更新支持。一些启动config配置等待后续完善
+# RCPC-test
 
-## 快速启动
-启动脚本在./examples/ipr-grpo/ipr-7B-GRPO.sh
+This repository is a cleaned RCPC/Qwen3-4B training copy. It keeps only the
+text-only Qwen3 cold-start SFT path and the fixed-rubric judge RCPC/GRPO path.
+Legacy vertical-domain training entrypoints and prompts were removed from this copy.
 
+## Stages
 
-## 数据集准备
-每条问题额外准备一条专家轨迹，通过data.target_key指定。对于一个问题，在update_policy时，会在n条on-policy样本上计算GRPO损失，在off-policy上计算SFT损失。
+1. Cold-start SFT on CoT data:
 
-## 相关论文可参考（仅展示部分）
-1. Learning to Reason under Off-Policy Guidance
-2. On-Policy RL Meets Off-Policy Experts: Harmonizing Supervised Fine-Tuning and Reinforcement Learning via Dynamic Weighting
-3. Towards a Unified View of Large Language Model Post-Training
+```bash
+bash examples/rcpc-sft/qwen3-4B-COT-SFT.sh
+```
+
+2. RCPC/GRPO with fixed rubrics and an external judge/verifier:
+
+```bash
+export JUDGE_MODEL="your-judge-model"
+export JUDGE_API_KEY="your-api-key"
+export JUDGE_BASE_URL="https://your-openai-compatible-endpoint"  # optional
+export JUDGE_API_STYLE="responses"                              # responses or chat_completions
+
+bash examples/rcpc-rubric-judge/qwen3-RUBRIC-JUDGE-RCPC-GRPO.sh
+```
+
+The default RCPC causal-intervention budget is `32`. Override it with:
+
+```bash
+RCPC_BUDGET=32 bash examples/rcpc-rubric-judge/qwen3-RUBRIC-JUDGE-RCPC-GRPO.sh
+```
+
+## Expected Data
+
+The SFT stage expects JSONL rows with `question`, `cot`, and `answer`.
+
+The RCPC/GRPO stage expects JSONL rows with:
+
+- `question`
+- `answer` or `reference_answer`
+- `rubric`: a list of rubric criteria with `title`, `description`, and `weight`
+
+Use `scripts/merge_rar_rubrics.py` if a QA split needs rubric fields copied
+from the original RaR-Science JSONL by matching `question`.
+
+## Judge Interface
+
+No GPT key or internal gateway is hardcoded in this copy. The verifier/judge is
+selected by environment variables and can be any OpenAI-compatible service:
+
+- `JUDGE_MODEL`
+- `JUDGE_API_KEY`
+- `JUDGE_BASE_URL`
+- `JUDGE_API_STYLE=responses|chat_completions`

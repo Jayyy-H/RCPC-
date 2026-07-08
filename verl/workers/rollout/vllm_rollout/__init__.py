@@ -14,7 +14,6 @@
 
 from .dtensor_weight_loaders import load_dtensor_weights
 from .vllm_rollout_spmd import vLLMRollout
-from .vllm_rollout_spmd_valley import vLLMRolloutValley
 
 
-__all__ = ["vLLMRollout", "vLLMRolloutValley", "load_dtensor_weights"]
+__all__ = ["vLLMRollout", "load_dtensor_weights"]
