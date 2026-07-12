@@ -745,6 +745,7 @@ class RopdIPRRewardScorer:
     def _collect_criterion_metrics(self, results: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
         combined_advantages = []
         format_valid_values = []
+        clipped_values = []
         raw_scores = []
         final_scores = []
         ok_values = []
@@ -752,6 +753,9 @@ class RopdIPRRewardScorer:
             ok_values.append(1.0 if result.get("ok", False) else 0.0)
             format_valid_values.extend(
                 1.0 if value else 0.0 for value in result.get("student_format_valid", [])
+            )
+            clipped_values.extend(
+                1.0 if value else 0.0 for value in result.get("student_response_clipped", [])
             )
             raw_scores.extend(float(value) for value in result.get("student_scores", []))
             scores = result.get("scores", {})
@@ -773,6 +777,9 @@ class RopdIPRRewardScorer:
                 ),
                 "reward/zero_score_on_format_error": 1.0 if self.zero_score_on_format_error else 0.0,
                 "reward/zero_criteria_on_format_error": 1.0 if self.zero_criteria_on_format_error else 0.0,
+                "reward/clipped_ratio": (
+                    sum(clipped_values) / len(clipped_values) if clipped_values else 0.0
+                ),
                 "reward/verifier_raw/mean": sum(raw_scores) / len(raw_scores) if raw_scores else 0.0,
                 "reward/verifier_raw/max": max(raw_scores) if raw_scores else 0.0,
                 "reward/verifier_raw/min": min(raw_scores) if raw_scores else 0.0,
@@ -807,6 +814,13 @@ class RopdIPRRewardScorer:
 
     def _has_training_group_keys(self, data: DataProto) -> bool:
         return "uid" in data.non_tensor_batch and "is_onpolicy" in data.non_tensor_batch
+
+    def _response_format_valid(self, info: Mapping[str, Any]) -> bool:
+        if not _has_strict_cot_format(str(info.get("response_text", ""))):
+            return False
+        if bool(info.get("response_clipped", False)):
+            return False
+        return True
 
     def _collect_response_infos(self, data: DataProto) -> List[Dict[str, Any]]:
         responses = data.batch["responses"]
@@ -858,6 +872,8 @@ class RopdIPRRewardScorer:
                     "response_token_offsets": build_token_offsets(self.tokenizer, valid_response_ids),
                     "response_token_uncertainties": token_uncertainties,
                     "response_length": response_length,
+                    "response_limit": int(response_width),
+                    "response_clipped": bool(response_length >= int(response_width)),
                     "global_step": int(getattr(self, "_current_global_step", -1)),
                 }
             )
@@ -937,10 +953,7 @@ class RopdIPRRewardScorer:
             )
             maximum_score = float(rubric["maximum_score"])
             normalized_scores = [max(0.0, min(1.0, score / maximum_score)) for score in student_scores]
-            student_format_valid = [
-                _has_strict_cot_format(info["response_text"])
-                for info in group
-            ]
+            student_format_valid = [self._response_format_valid(info) for info in group]
             if self.zero_score_on_format_error:
                 normalized_scores = [
                     score if student_format_valid[index] else 0.0
@@ -968,6 +981,7 @@ class RopdIPRRewardScorer:
                 "criterion_stats": criterion_stats,
                 "student_scores": student_scores,
                 "student_format_valid": student_format_valid,
+                "student_response_clipped": [bool(info.get("response_clipped", False)) for info in group],
                 "student_verifier_answers": student_verifier_answers,
                 "student_answers": [item["response_text"] for item in group],
                 "student_batch_indices": [item["batch_index"] for item in group],
@@ -997,9 +1011,13 @@ class RopdIPRRewardScorer:
             return result
         except Exception as exc:
             timing_metrics["timing_s/reward/group_total"] = time.perf_counter() - group_start
+            student_format_valid = [self._response_format_valid(info) for info in group]
             scores = {}
-            for info in group:
-                scores[info["batch_index"]] = self._rule_score(info) if self.fallback_to_ipr else 0.0
+            for index, info in enumerate(group):
+                score = self._rule_score(info) if self.fallback_to_ipr else 0.0
+                if self.zero_score_on_format_error and not student_format_valid[index]:
+                    score = 0.0
+                scores[info["batch_index"]] = score
             fallback_advantages = _compute_outcome_group_advantages(
                 [float(scores[info["batch_index"]]) for info in group]
             )
@@ -1013,10 +1031,8 @@ class RopdIPRRewardScorer:
                 },
                 "criterion_stats": {},
                 "student_scores": [],
-                "student_format_valid": [
-                    _has_strict_cot_format(info["response_text"])
-                    for info in group
-                ],
+                "student_format_valid": student_format_valid,
+                "student_response_clipped": [bool(info.get("response_clipped", False)) for info in group],
                 "student_verifier_answers": [],
                 "student_answers": [info["response_text"] for info in group],
                 "student_batch_indices": [info["batch_index"] for info in group],
@@ -1844,13 +1860,16 @@ class RopdIPRRewardScorer:
                         score_value = "N/A"
                     format_valid = result.get("student_format_valid") or []
                     format_value = format_valid[index - 1] if index - 1 < len(format_valid) else "N/A"
+                    clipped_values = result.get("student_response_clipped") or []
+                    clipped_value = clipped_values[index - 1] if index - 1 < len(clipped_values) else "N/A"
                     print(
-                        "[ropd student answer {} score={} format_valid={} chars={} "
+                        "[ropd student answer {} score={} format_valid={} clipped={} chars={} "
                         "has_<reasoning>={} has_</reasoning>={} has_<answer>={} has_</answer>={} "
                         "has_legacy_<think>={}]".format(
                             index,
                             score_value,
                             format_value,
+                            clipped_value,
                             len(str(answer)),
                             "<reasoning>" in str(answer).lower(),
                             "</reasoning>" in str(answer).lower(),
