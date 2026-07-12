@@ -20,7 +20,6 @@ from verl.utils.reward_score.ropd import (
     _as_list,
     _compute_outcome_group_advantages,
     _extract_json_payload,
-    _has_strict_cot_format,
     _render_answer_block,
     _render_template,
     _sample_std,
@@ -222,10 +221,7 @@ class FixedRubricRCPCRewardScorer(RopdIPRRewardScorer):
                 self._normalize_signed_score(score, rubric)
                 for score in student_scores
             ]
-            student_format_valid = [
-                _has_strict_cot_format(info["response_text"])
-                for info in group
-            ]
+            student_format_valid = [self._response_format_valid(info) for info in group]
             if self.zero_score_on_format_error:
                 normalized_scores = [
                     score if student_format_valid[index] else 0.0
@@ -254,6 +250,7 @@ class FixedRubricRCPCRewardScorer(RopdIPRRewardScorer):
                 "criterion_stats": criterion_stats,
                 "student_scores": student_scores,
                 "student_format_valid": student_format_valid,
+                "student_response_clipped": [bool(info.get("response_clipped", False)) for info in group],
                 "student_verifier_answers": verifier_payload["answers"],
                 "student_answers": [item["response_text"] for item in group],
                 "student_batch_indices": [item["batch_index"] for item in group],
@@ -294,10 +291,8 @@ class FixedRubricRCPCRewardScorer(RopdIPRRewardScorer):
                 },
                 "criterion_stats": {},
                 "student_scores": [],
-                "student_format_valid": [
-                    _has_strict_cot_format(info["response_text"])
-                    for info in group
-                ],
+                "student_format_valid": [self._response_format_valid(info) for info in group],
+                "student_response_clipped": [bool(info.get("response_clipped", False)) for info in group],
                 "student_verifier_answers": [],
                 "student_answers": [info["response_text"] for info in group],
                 "student_batch_indices": [info["batch_index"] for info in group],
