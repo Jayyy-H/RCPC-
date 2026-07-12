@@ -95,8 +95,8 @@ worker:
     # reward/criterion signal to zero while the SFT checkpoint is still learning
     # to close <reasoning> and emit <answer>. Otherwise reward becomes identically
     # zero and RCPC cannot select interventions.
-    ropd_zero_score_on_format_error: false
-    ropd_zero_criteria_on_format_error: false
+    ropd_zero_score_on_format_error: true
+    ropd_zero_criteria_on_format_error: true
     ropd_fallback_to_ipr: false
     ropd_score_offpolicy: false
     ropd_use_criterion_advantage: true
