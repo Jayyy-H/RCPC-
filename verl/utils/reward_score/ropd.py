@@ -18,8 +18,10 @@ from verl.utils.reward_score.ipr import ipr_compute_score
 from verl.utils.reward_score.rcpc import (
     apply_intervention,
     build_candidates,
+    build_group_candidates,
     build_token_advantages,
     build_token_offsets,
+    paired_effect_statistics,
 )
 
 
@@ -453,13 +455,12 @@ class RopdIPRRewardScorer:
         self.rcpc_intervention_mode = str(_cfg(reward_config, "ropd_rcpc_intervention_mode", "mask"))
         self.rcpc_batch_counterfactual = bool(_cfg(reward_config, "ropd_rcpc_batch_counterfactual", True))
         self.rcpc_counterfactual_samples = max(
-            1, int(_cfg(reward_config, "ropd_rcpc_counterfactual_samples", 1))
+            1, int(_cfg(reward_config, "ropd_rcpc_counterfactual_samples", 2))
         )
         self.rcpc_counterfactual_batch_size = int(
             _cfg(reward_config, "ropd_rcpc_counterfactual_batch_size", 0)
         )
         self.rcpc_transport_lambda = float(_cfg(reward_config, "ropd_rcpc_transport_lambda", 1.0))
-        self.rcpc_effect_noise_floor = float(_cfg(reward_config, "ropd_rcpc_effect_noise_floor", 0.05))
         self.rcpc_fallback_to_criterion_advantage = bool(
             _cfg(reward_config, "ropd_rcpc_fallback_to_criterion_advantage", True)
         )
@@ -681,12 +682,20 @@ class RopdIPRRewardScorer:
         metrics["timing_s/rcpc/build_intervention_plan_wall"] = time.perf_counter() - section_start
         metrics["rcpc/intervention_plan_count"] = float(len(plans))
         metrics["rcpc/intervention_item_count"] = float(len(all_items))
-        requested_samples = len(all_items) * self.rcpc_counterfactual_samples
+        arm_count = 2 if self.rcpc_intervention_mode == "prefix_regen" else 1
+        requested_samples = len(all_items) * self.rcpc_counterfactual_samples * arm_count
         metrics["rcpc/counterfactual_requested_samples"] = float(requested_samples)
-        requested_new_tokens = [
-            float(item.get("max_new_tokens", 0) or 0.0)
-            for item in all_items
-        ]
+        requested_new_tokens = []
+        for item in all_items:
+            if self.rcpc_intervention_mode == "prefix_regen":
+                requested_new_tokens.extend(
+                    [
+                        float(item.get("factual_max_new_tokens", 0) or 0.0),
+                        float(item.get("control_max_new_tokens", 0) or 0.0),
+                    ]
+                )
+            else:
+                requested_new_tokens.append(float(item.get("max_new_tokens", 0) or 0.0))
         metrics["rcpc/counterfactual_max_new_tokens_mean"] = (
             sum(requested_new_tokens) / len(requested_new_tokens)
             if requested_new_tokens
@@ -836,7 +845,7 @@ class RopdIPRRewardScorer:
 
     def _collect_response_infos(self, data: DataProto) -> List[Dict[str, Any]]:
         responses = data.batch["responses"]
-        old_log_probs = data.batch.get("old_log_probs", None)
+        token_entropies = data.batch.get("token_entropies", None)
         response_width = responses.shape[-1]
         attention_mask = data.batch["attention_mask"]
         response_mask = attention_mask[:, -response_width:]
@@ -854,12 +863,12 @@ class RopdIPRRewardScorer:
             response_length = int(valid_response_lengths[batch_index].item())
             valid_response_ids = responses[batch_index][:response_length].detach().cpu().tolist()
             response_text = self._decode_response_text(responses[batch_index], response_length)
-            if old_log_probs is not None and response_length > 0:
-                token_uncertainties = (
-                    -old_log_probs[batch_index][:response_length].detach().float().cpu()
+            if token_entropies is not None and response_length > 0:
+                response_token_entropies = (
+                    token_entropies[batch_index][:response_length].detach().float().cpu()
                 ).tolist()
             else:
-                token_uncertainties = [0.0] * response_length
+                response_token_entropies = [0.0] * response_length
             raw_prompt = (
                 raw_prompts[batch_index]
                 if batch_index < len(raw_prompts)
@@ -882,7 +891,7 @@ class RopdIPRRewardScorer:
                     "response_text": response_text,
                     "response_token_ids": valid_response_ids,
                     "response_token_offsets": build_token_offsets(self.tokenizer, valid_response_ids),
-                    "response_token_uncertainties": token_uncertainties,
+                    "response_token_entropies": response_token_entropies,
                     "response_length": response_length,
                     "response_limit": int(response_width),
                     "response_clipped": bool(response_length >= int(response_width)),
@@ -1076,10 +1085,7 @@ class RopdIPRRewardScorer:
         if not self.rcpc_enabled or not result.get("ok", False):
             return
         try:
-            candidates = [
-                self._build_rcpc_candidates_for_response(info)
-                for info in group
-            ]
+            candidates = self._build_rcpc_candidates_for_group(group)
             result["rcpc_candidates"] = candidates
             interventions = {}
             if self.rcpc_intervention_enabled and first.get("run_rcpc_intervention", False):
@@ -1091,15 +1097,32 @@ class RopdIPRRewardScorer:
         except Exception as exc:
             result["rcpc_error"] = "{}: {}".format(type(exc).__name__, exc)
 
+    def _build_rcpc_candidates_for_group(
+        self,
+        group: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if self.rcpc_derive_candidates_from_budget:
+            return build_group_candidates(
+                group,
+                top_actions=self.rcpc_top_actions,
+                top_blocks=self.rcpc_top_blocks,
+                min_action_chars=self.rcpc_min_action_chars,
+                max_action_chars=self.rcpc_max_action_chars,
+                max_action_tokens=self.rcpc_max_action_tokens,
+                min_robust_denom=self.rcpc_min_robust_denom,
+                min_anchor_z=self.rcpc_min_anchor_z,
+            )
+        return [self._build_rcpc_candidates_for_response(info) for info in group]
+
     def _build_rcpc_candidates_for_response(self, info: Mapping[str, Any]) -> Dict[str, Any]:
-        token_uncertainties = list(info.get("response_token_uncertainties") or [])
+        token_entropies = list(info.get("response_token_entropies") or [])
         response_length = int(info.get("response_length", 0))
-        if len(token_uncertainties) < response_length:
-            token_uncertainties.extend([0.0] * (response_length - len(token_uncertainties)))
+        if len(token_entropies) < response_length:
+            token_entropies.extend([0.0] * (response_length - len(token_entropies)))
         return build_candidates(
             str(info.get("response_text", "")),
             info.get("response_token_offsets") or [],
-            token_uncertainties,
+            token_entropies,
             top_actions=self.rcpc_top_actions,
             top_blocks=self.rcpc_top_blocks,
             min_action_chars=self.rcpc_min_action_chars,
@@ -1177,19 +1200,31 @@ class RopdIPRRewardScorer:
                     "block": block,
                 }
                 if self.rcpc_intervention_mode == "prefix_regen":
-                    prefix_token_end = max(0, int(block.get("token_start", 0)))
-                    prefix_response_token_ids = list(info.get("response_token_ids", []))[:prefix_token_end]
+                    response_token_ids = list(info.get("response_token_ids", []))
+                    control_prefix_end = max(0, int(block.get("token_start", 0)))
+                    factual_prefix_end = min(
+                        len(response_token_ids),
+                        max(control_prefix_end, int(block.get("token_end", -1)) + 1),
+                    )
+                    control_prefix_ids = response_token_ids[:control_prefix_end]
+                    factual_prefix_ids = response_token_ids[:factual_prefix_end]
                     if not info.get("raw_prompt_ids"):
                         raise RuntimeError("prefix_regen requires raw_prompt_ids in the rollout batch")
-                    max_new_tokens = max(
+                    control_max_new_tokens = max(
                         1,
-                        int(info.get("response_length", 0)) - len(prefix_response_token_ids),
+                        int(info.get("response_length", 0)) - len(control_prefix_ids),
+                    )
+                    factual_max_new_tokens = max(
+                        1,
+                        int(info.get("response_length", 0)) - len(factual_prefix_ids),
                     )
                     item.update(
                         {
                             "raw_prompt_ids": list(info["raw_prompt_ids"]),
-                            "prefix_response_token_ids": prefix_response_token_ids,
-                            "max_new_tokens": max_new_tokens,
+                            "control_prefix_response_token_ids": control_prefix_ids,
+                            "factual_prefix_response_token_ids": factual_prefix_ids,
+                            "control_max_new_tokens": control_max_new_tokens,
+                            "factual_max_new_tokens": factual_max_new_tokens,
                         }
                     )
                 else:
@@ -1212,10 +1247,18 @@ class RopdIPRRewardScorer:
             expanded_items = []
             for parent_index, item in enumerate(intervention_items):
                 for sample_index in range(samples):
-                    expanded_item = dict(item)
-                    expanded_item["_rcpc_parent_item_index"] = parent_index
-                    expanded_item["_rcpc_sample_index"] = sample_index
-                    expanded_items.append(expanded_item)
+                    pair_seed_offset = parent_index * samples + sample_index
+                    for arm in ("factual", "control"):
+                        expanded_item = dict(item)
+                        expanded_item["prefix_response_token_ids"] = list(
+                            item[f"{arm}_prefix_response_token_ids"]
+                        )
+                        expanded_item["max_new_tokens"] = int(item[f"{arm}_max_new_tokens"])
+                        expanded_item["_rcpc_parent_item_index"] = parent_index
+                        expanded_item["_rcpc_sample_index"] = sample_index
+                        expanded_item["_rcpc_arm"] = arm
+                        expanded_item["_rcpc_pair_seed_offset"] = pair_seed_offset
+                        expanded_items.append(expanded_item)
             batch_size = int(self.rcpc_counterfactual_batch_size)
             generated_answers = []
             with self._counterfactual_lock:
@@ -1249,20 +1292,31 @@ class RopdIPRRewardScorer:
                         len(generated_answers), len(expanded_items)
                     )
                 )
-            texts_by_parent: Dict[int, List[str]] = defaultdict(list)
+            texts_by_parent_arm: Dict[Tuple[int, str], List[Tuple[int, str]]] = defaultdict(list)
             for expanded_item, generated_text in zip(expanded_items, generated_answers):
-                texts_by_parent[int(expanded_item["_rcpc_parent_item_index"])].append(str(generated_text))
+                key = (
+                    int(expanded_item["_rcpc_parent_item_index"]),
+                    str(expanded_item["_rcpc_arm"]),
+                )
+                texts_by_parent_arm[key].append(
+                    (int(expanded_item["_rcpc_sample_index"]), str(generated_text))
+                )
             for parent_index, item in enumerate(intervention_items):
-                texts = texts_by_parent.get(parent_index, [])
-                if len(texts) != samples:
-                    raise RuntimeError(
-                        "counterfactual generator produced {} samples for item {}, expected {}".format(
-                            len(texts), parent_index, samples
+                for arm in ("factual", "control"):
+                    indexed_texts = sorted(texts_by_parent_arm.get((parent_index, arm), []))
+                    texts = [text for _sample_index, text in indexed_texts]
+                    if len(texts) != samples:
+                        raise RuntimeError(
+                            "RCPC generator produced {} {} samples for item {}, expected {}".format(
+                                len(texts), arm, parent_index, samples
+                            )
                         )
-                    )
-                item["texts"] = texts
-                item["text"] = texts[0] if texts else ""
-                item["counterfactual_sample_count"] = len(texts)
+                    item[f"{arm}_texts"] = texts
+                item["texts"] = list(item["control_texts"])
+                item["text"] = item["control_texts"][0] if item["control_texts"] else ""
+                item["factual_sample_count"] = len(item["factual_texts"])
+                item["control_sample_count"] = len(item["control_texts"])
+                item["counterfactual_sample_count"] = len(item["control_texts"])
 
     def _score_rcpc_intervention_items(
         self,
@@ -1275,70 +1329,152 @@ class RopdIPRRewardScorer:
             return {}
 
         flat_items = []
-        flat_texts = []
         for item_index, item in enumerate(intervention_items):
-            texts = item.get("texts")
-            if not isinstance(texts, list) or not texts:
-                texts = [item.get("text", "")]
-            for sample_index, text in enumerate(texts):
-                flat_items.append((item_index, item, sample_index))
-                flat_texts.append(str(text))
-        payload = self._verify_answers(
-            dict(first),
+            factual_texts = item.get("factual_texts")
+            control_texts = item.get("control_texts")
+            if isinstance(factual_texts, list) and isinstance(control_texts, list):
+                arm_texts = (("factual", factual_texts), ("control", control_texts))
+            else:
+                texts = item.get("texts")
+                if not isinstance(texts, list) or not texts:
+                    texts = [item.get("text", "")]
+                arm_texts = (("control", texts),)
+            for arm, texts in arm_texts:
+                for sample_index, text in enumerate(texts):
+                    flat_items.append((item_index, arm, sample_index, str(text)))
+        answers_by_flat_key = self._verify_rcpc_arm_entries(
+            first,
             result["rubric"],
-            flat_texts,
+            flat_items,
         )
         original_answers = list(result["student_verifier_answers"])
-        original_format_valid = list(result.get("student_format_valid", []))
         criterion_ids = [str(item["criterion_id"]) for item in result["rubric"]["rubrics"]]
-        answers_by_item: Dict[int, List[Mapping[str, Any]]] = defaultdict(list)
-        for (item_index, _item, _sample_index), intervened_answer in zip(flat_items, payload["answers"]):
-            answers_by_item[int(item_index)].append(intervened_answer)
+        answers_by_item_arm: Dict[Tuple[int, str], List[Tuple[int, Mapping[str, Any], str]]] = defaultdict(list)
+        for item_index, arm, sample_index, text in flat_items:
+            answer = answers_by_flat_key[(int(item_index), str(arm), int(sample_index))]
+            answers_by_item_arm[(int(item_index), arm)].append((sample_index, answer, text))
         restored: Dict[int, Dict[int, Dict[str, Any]]] = defaultdict(dict)
         for item_index, item in enumerate(intervention_items):
-            intervened_answers = answers_by_item.get(item_index, [])
-            if not intervened_answers:
+            control_entries = sorted(answers_by_item_arm.get((item_index, "control"), []))
+            if not control_entries:
                 continue
             response_index = int(item["response_index"])
             original = original_answers[response_index]
-            criterion_effects = {}
-            for criterion_index, criterion_id in enumerate(criterion_ids):
-                original_judgement = bool(original["judgement"][criterion_index])
-                if self.zero_criteria_on_format_error and not original_format_valid[response_index]:
-                    original_judgement = False
-                intervened_values = [
-                    1.0 if bool(answer["judgement"][criterion_index]) else 0.0
-                    for answer in intervened_answers
+            factual_entries = sorted(answers_by_item_arm.get((item_index, "factual"), []))
+            if not factual_entries:
+                factual_entries = [
+                    (sample_index, original, str(group[response_index]["response_text"]))
+                    for sample_index in range(len(control_entries))
                 ]
-                mean_intervened_value = (
-                    sum(intervened_values) / len(intervened_values) if intervened_values else 0.0
+            if len(factual_entries) != len(control_entries):
+                raise RuntimeError(
+                    "paired RCPC verifier count mismatch for item {}: factual={} control={}".format(
+                        item_index, len(factual_entries), len(control_entries)
+                    )
                 )
-                criterion_effects[criterion_id] = (
-                    (1.0 if original_judgement else 0.0)
-                    - mean_intervened_value
-                )
-            intervened_scores = [float(answer["final_score"]) for answer in intervened_answers]
-            mean_intervened_score = (
-                sum(intervened_scores) / len(intervened_scores) if intervened_scores else 0.0
-            )
-            intervened_texts = item.get("texts")
-            if not isinstance(intervened_texts, list) or not intervened_texts:
-                intervened_texts = [str(item.get("text", ""))]
+            factual_answers = [entry[1] for entry in factual_entries]
+            control_answers = [entry[1] for entry in control_entries]
+            factual_texts = [entry[2] for entry in factual_entries]
+            control_texts = [entry[2] for entry in control_entries]
+            factual_format_valid = [_has_strict_cot_format(text) for text in factual_texts]
+            control_format_valid = [_has_strict_cot_format(text) for text in control_texts]
+            criterion_effects = {}
+            criterion_variances = {}
+            criterion_standard_errors = {}
+            criterion_paired_differences = {}
+            for criterion_index, criterion_id in enumerate(criterion_ids):
+                factual_values = [
+                    1.0 if bool(answer["judgement"][criterion_index]) else 0.0
+                    for answer in factual_answers
+                ]
+                control_values = [
+                    1.0 if bool(answer["judgement"][criterion_index]) else 0.0
+                    for answer in control_answers
+                ]
+                if self.zero_criteria_on_format_error:
+                    factual_values = [
+                        value if factual_format_valid[index] else 0.0
+                        for index, value in enumerate(factual_values)
+                    ]
+                    control_values = [
+                        value if control_format_valid[index] else 0.0
+                        for index, value in enumerate(control_values)
+                    ]
+                stats = paired_effect_statistics(factual_values, control_values)
+                criterion_effects[criterion_id] = float(stats["effect"])
+                criterion_variances[criterion_id] = float(stats["estimator_variance"])
+                criterion_standard_errors[criterion_id] = float(stats["standard_error"])
+                criterion_paired_differences[criterion_id] = list(stats["paired_differences"])
+            factual_scores = [float(answer["final_score"]) for answer in factual_answers]
+            control_scores = [float(answer["final_score"]) for answer in control_answers]
+            if self.zero_score_on_format_error:
+                factual_scores = [
+                    value if factual_format_valid[index] else 0.0
+                    for index, value in enumerate(factual_scores)
+                ]
+                control_scores = [
+                    value if control_format_valid[index] else 0.0
+                    for index, value in enumerate(control_scores)
+                ]
+            score_stats = paired_effect_statistics(factual_scores, control_scores)
+            mean_factual_score = sum(factual_scores) / len(factual_scores)
+            mean_control_score = sum(control_scores) / len(control_scores)
             restored[item["batch_index"]][int(item["block_index"])] = {
                 "response_index": response_index,
                 "batch_index": int(item["batch_index"]),
                 "block_index": int(item["block_index"]),
                 "block": item["block"],
-                "intervened_text": str(item.get("text", "")),
-                "intervened_texts": [str(text) for text in intervened_texts],
-                "counterfactual_sample_count": len(intervened_answers),
+                "factual_text": factual_texts[0] if factual_texts else "",
+                "factual_texts": factual_texts,
+                "control_text": control_texts[0] if control_texts else "",
+                "control_texts": control_texts,
+                "intervened_text": control_texts[0] if control_texts else "",
+                "intervened_texts": control_texts,
+                "factual_sample_count": len(factual_answers),
+                "control_sample_count": len(control_answers),
+                "counterfactual_sample_count": len(control_answers),
                 "criterion_effects": criterion_effects,
+                "criterion_variances": criterion_variances,
+                "criterion_standard_errors": criterion_standard_errors,
+                "criterion_paired_differences": criterion_paired_differences,
                 "original_score": float(original["final_score"]),
-                "intervened_score": mean_intervened_score,
-                "intervened_scores": intervened_scores,
-                "score_effect": float(original["final_score"]) - mean_intervened_score,
+                "factual_score": mean_factual_score,
+                "factual_scores": factual_scores,
+                "control_score": mean_control_score,
+                "control_scores": control_scores,
+                "intervened_score": mean_control_score,
+                "intervened_scores": control_scores,
+                "score_effect": float(score_stats["effect"]),
+                "score_effect_variance": float(score_stats["estimator_variance"]),
+                "score_effect_standard_error": float(score_stats["standard_error"]),
             }
         return {int(batch_index): dict(value) for batch_index, value in restored.items()}
+
+    def _verify_rcpc_arm_entries(
+        self,
+        first: Mapping[str, Any],
+        rubric: Mapping[str, Any],
+        flat_items: Sequence[Tuple[int, str, int, str]],
+    ) -> Dict[Tuple[int, str, int], Mapping[str, Any]]:
+        """Verify factual and control arms separately to bound output size."""
+        answers_by_key: Dict[Tuple[int, str, int], Mapping[str, Any]] = {}
+        arm_order = list(OrderedDict((str(item[1]), None) for item in flat_items).keys())
+        for arm in arm_order:
+            arm_items = [item for item in flat_items if str(item[1]) == arm]
+            payload = self._verify_answers(
+                dict(first),
+                dict(rubric),
+                [str(item[3]) for item in arm_items],
+            )
+            for item, answer in zip(arm_items, payload["answers"]):
+                answers_by_key[(int(item[0]), str(item[1]), int(item[2]))] = answer
+        if len(answers_by_key) != len(flat_items):
+            raise RuntimeError(
+                "RCPC verifier returned {} answers for {} arm samples".format(
+                    len(answers_by_key), len(flat_items)
+                )
+            )
+        return answers_by_key
 
     def _criterion_advantages_for_response(
         self,
@@ -1376,7 +1512,6 @@ class RopdIPRRewardScorer:
                 intervention_effects=interventions.get(batch_index),
                 fallback_to_full_response=self.rcpc_fallback_to_criterion_advantage,
                 transport_lambda=self.rcpc_transport_lambda,
-                effect_noise_floor=self.rcpc_effect_noise_floor,
             )
             token_advantages[batch_index] = values
             for key, value in metrics.items():
@@ -1968,10 +2103,17 @@ class RopdIPRRewardScorer:
                         "anchor_robust_z": float(block.get("anchor_robust_z", 0.0)),
                         "block_mean_robust_z": float(block.get("block_mean_robust_z", 0.0)),
                         "text": str(block.get("text", "")),
-                        "intervened_text_preview": str(payload.get("intervened_text", ""))[:1200],
+                        "factual_text_preview": str(payload.get("factual_text", ""))[:1200],
+                        "control_text_preview": str(payload.get("control_text", ""))[:1200],
+                        "factual_sample_count": int(payload.get("factual_sample_count", 0)),
+                        "control_sample_count": int(payload.get("control_sample_count", 0)),
                         "counterfactual_sample_count": int(payload.get("counterfactual_sample_count", 1)),
+                        "factual_scores": payload.get("factual_scores", []),
+                        "control_scores": payload.get("control_scores", []),
                         "intervened_scores": payload.get("intervened_scores", []),
                         "criterion_effects": payload.get("criterion_effects", {}),
+                        "criterion_standard_errors": payload.get("criterion_standard_errors", {}),
+                        "criterion_paired_differences": payload.get("criterion_paired_differences", {}),
                         "calibrated_effects": payload.get("calibrated_effects", {}),
                         "score_effect": float(payload.get("score_effect", 0.0)),
                         "original_score": float(payload.get("original_score", 0.0)),
@@ -1997,19 +2139,19 @@ class RopdIPRRewardScorer:
             "budget": {
                 "B_group": self.rcpc_budget,
                 "derive_candidates_from_budget": self.rcpc_derive_candidates_from_budget,
-                "effective_top_actions": self.rcpc_top_actions,
-                "effective_top_blocks": self.rcpc_top_blocks,
+                "group_top_actions": self.rcpc_top_actions,
+                "group_top_blocks": self.rcpc_top_blocks,
                 "groups_per_batch": self.rcpc_intervention_max_groups_per_batch,
                 "blocks_per_answer": self.rcpc_intervention_max_blocks_per_answer,
                 "blocks_per_group": self.rcpc_intervention_max_blocks_per_group,
-                "counterfactual_samples": self.rcpc_counterfactual_samples,
+                "paired_samples_per_arm": self.rcpc_counterfactual_samples,
                 "counterfactual_batch_size": self.rcpc_counterfactual_batch_size,
                 "print_max_groups": self.rcpc_print_max_groups,
                 "print_max_blocks": self.rcpc_print_max_blocks,
             },
             "transport": {
                 "lambda": self.rcpc_transport_lambda,
-                "effect_noise_floor": self.rcpc_effect_noise_floor,
+                "calibration": "paired_estimator_variance",
             },
             "scores": result.get("scores", {}),
             "criterion_advantages": result.get("criterion_advantages", {}),

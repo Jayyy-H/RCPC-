@@ -18,6 +18,7 @@ When working with FSDP:
 - Utilize state_dict from the FSDP to synchronize the weights among tp ranks in vLLM
 """
 
+import copy
 import inspect
 from contextlib import contextmanager
 from typing import Any, List, Union
@@ -238,6 +239,8 @@ class vLLMRollout(BaseRollout):
             }
 
         non_tensor_batch = prompts.non_tensor_batch
+        rcpc_request_seeds = non_tensor_batch.pop("rcpc_request_seeds", None)
+        rcpc_request_max_new_tokens = non_tensor_batch.pop("rcpc_request_max_new_tokens", None)
         target_ids = non_tensor_batch.pop("target_ids", None) if include_targets else None
         if batch_size != len(non_tensor_batch["raw_prompt_ids"]):
             raise RuntimeError("vllm sharding manager is not work properly.")
@@ -269,8 +272,20 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**sampling_overrides):
+            sampling_params = self.sampling_params
+            if rcpc_request_seeds is not None or rcpc_request_max_new_tokens is not None:
+                sampling_params = []
+                for request_index in range(batch_size):
+                    request_params = copy.copy(self.sampling_params)
+                    if rcpc_request_seeds is not None:
+                        request_params.seed = int(rcpc_request_seeds[request_index])
+                    if rcpc_request_max_new_tokens is not None:
+                        request_params.max_tokens = max(
+                            1, int(rcpc_request_max_new_tokens[request_index])
+                        )
+                    sampling_params.append(request_params)
             completions: List[RequestOutput] = self.inference_engine.generate(
-                prompts=vllm_inputs, sampling_params=self.sampling_params
+                prompts=vllm_inputs, sampling_params=sampling_params
             )
 
         response_ids = []

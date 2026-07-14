@@ -530,9 +530,13 @@ class FSDPWorker(Worker):
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            output = self.actor.compute_log_prob(data=data)
+            log_probs, token_entropies = self.actor.compute_log_prob(data=data)
             output = DataProto.from_dict(
-                tensors={"old_log_probs": output}, meta_info={"temperature": self.config.rollout.temperature}
+                tensors={
+                    "old_log_probs": log_probs,
+                    "token_entropies": token_entropies,
+                },
+                meta_info={"temperature": self.config.rollout.temperature},
             )
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
@@ -559,8 +563,8 @@ class FSDPWorker(Worker):
         data.meta_info["temperature"] = self.config.rollout.temperature
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            output = self.ref_policy.compute_log_prob(data=data)
-            output = DataProto.from_dict(tensors={"ref_log_prob": output})
+            log_probs, _token_entropies = self.ref_policy.compute_log_prob(data=data)
+            output = DataProto.from_dict(tensors={"ref_log_prob": log_probs})
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
         output = output.to("cpu")

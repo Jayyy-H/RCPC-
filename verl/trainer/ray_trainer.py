@@ -666,6 +666,8 @@ class RayPPOTrainer:
         prompt_id_lists: list[list[int]],
         *,
         max_new_tokens: int,
+        request_seeds: Optional[list[int]] = None,
+        request_max_new_tokens: Optional[list[int]] = None,
     ) -> DataProto:
         if not prompt_id_lists:
             raise ValueError("empty counterfactual prompt list")
@@ -682,15 +684,24 @@ class RayPPOTrainer:
             input_ids[row_index, -len(token_ids):] = values
             attention_mask[row_index, -len(token_ids):] = 1
         position_ids = torch.clip(attention_mask.cumsum(dim=-1) - 1, min=0)
+        non_tensors = {
+            "raw_prompt_ids": _object_array([list(item) for item in prompt_id_lists]),
+        }
+        if request_seeds is not None:
+            non_tensors["rcpc_request_seeds"] = _object_array(
+                [int(value) for value in request_seeds]
+            )
+        if request_max_new_tokens is not None:
+            non_tensors["rcpc_request_max_new_tokens"] = _object_array(
+                [int(value) for value in request_max_new_tokens]
+            )
         return DataProto.from_dict(
             tensors={
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
             },
-            non_tensors={
-                "raw_prompt_ids": _object_array([list(item) for item in prompt_id_lists]),
-            },
+            non_tensors=non_tensors,
             meta_info={
                 "do_sample": True,
                 "rcpc_counterfactual": True,
@@ -713,6 +724,8 @@ class RayPPOTrainer:
         prompt_id_lists = []
         prefix_texts = []
         requested_new_tokens = []
+        request_seeds = []
+        rollout_seed = int(getattr(self.config.worker.rollout, "seed", 0))
         forced_prefix = str(getattr(self.config.worker.rollout, "forced_response_prefix", "") or "")
         forced_prefix_ids = (
             self.tokenizer.encode(forced_prefix, add_special_tokens=False)
@@ -737,14 +750,28 @@ class RayPPOTrainer:
                     clean_up_tokenization_spaces=False,
                 )
             )
-            requested_new_tokens.append(max(1, int(request.get("max_new_tokens", self.config.data.max_response_length))))
+            available_tokens = max(1, max_model_len - len(prompt_ids))
+            requested_new_tokens.append(
+                min(
+                    available_tokens,
+                    max(1, int(request.get("max_new_tokens", self.config.data.max_response_length))),
+                )
+            )
+            request_seeds.append(
+                rollout_seed + int(request.get("_rcpc_pair_seed_offset", len(request_seeds)))
+            )
 
         max_prompt_len = max(len(item) for item in prompt_id_lists)
         max_new_tokens = min(max(requested_new_tokens), max(1, max_model_len - max_prompt_len))
         if max_new_tokens <= 0:
             return list(prefix_texts)
 
-        prompt_proto = self._build_text_only_prompt_proto(prompt_id_lists, max_new_tokens=max_new_tokens)
+        prompt_proto = self._build_text_only_prompt_proto(
+            prompt_id_lists,
+            max_new_tokens=max_new_tokens,
+            request_seeds=request_seeds,
+            request_max_new_tokens=requested_new_tokens,
+        )
         with self._counterfactual_generation_lock:
             prompt_proto_padded, pad_size = pad_dataproto_to_divisor(
                 prompt_proto,
@@ -761,9 +788,7 @@ class RayPPOTrainer:
         generated_texts = []
         for row_index in range(response_ids.shape[0]):
             valid_length = int(response_mask[row_index].sum().item())
-            requested_length = max(1, int(requested_new_tokens[row_index]))
-            suffix_length = min(valid_length, requested_length)
-            suffix_ids = response_ids[row_index][:suffix_length]
+            suffix_ids = response_ids[row_index][:valid_length]
             suffix_text = self.tokenizer.decode(
                 suffix_ids,
                 skip_special_tokens=True,

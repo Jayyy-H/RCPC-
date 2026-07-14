@@ -20,10 +20,12 @@ from verl.utils.reward_score.ropd import (
     _as_list,
     _compute_outcome_group_advantages,
     _extract_json_payload,
+    _has_strict_cot_format,
     _render_answer_block,
     _render_template,
     _sample_std,
 )
+from verl.utils.reward_score.rcpc import paired_effect_statistics
 
 
 FIXED_RUBRIC_SCHEMA_VERSION = "rcpc.fixed_rubric.v1"
@@ -364,70 +366,126 @@ class FixedRubricRCPCRewardScorer(RopdIPRRewardScorer):
             return {}
 
         flat_items = []
-        flat_texts = []
         for item_index, item in enumerate(intervention_items):
-            texts = item.get("texts")
-            if not isinstance(texts, list) or not texts:
-                texts = [item.get("text", "")]
-            for sample_index, text in enumerate(texts):
-                flat_items.append((item_index, item, sample_index))
-                flat_texts.append(str(text))
-        payload = self._verify_answers(
-            dict(first),
+            factual_texts = item.get("factual_texts")
+            control_texts = item.get("control_texts")
+            if isinstance(factual_texts, list) and isinstance(control_texts, list):
+                arm_texts = (("factual", factual_texts), ("control", control_texts))
+            else:
+                texts = item.get("texts")
+                if not isinstance(texts, list) or not texts:
+                    texts = [item.get("text", "")]
+                arm_texts = (("control", texts),)
+            for arm, texts in arm_texts:
+                for sample_index, text in enumerate(texts):
+                    flat_items.append((item_index, arm, sample_index, str(text)))
+        answers_by_flat_key = self._verify_rcpc_arm_entries(
+            first,
             result["rubric"],
-            flat_texts,
+            flat_items,
         )
         original_answers = list(result["student_verifier_answers"])
-        original_format_valid = list(result.get("student_format_valid", []))
         criteria = list(result["rubric"]["rubrics"])
-        answers_by_item: Dict[int, List[Mapping[str, Any]]] = defaultdict(list)
-        for (item_index, _item, _sample_index), intervened_answer in zip(flat_items, payload["answers"]):
-            answers_by_item[int(item_index)].append(intervened_answer)
+        answers_by_item_arm: Dict[Tuple[int, str], List[Tuple[int, Mapping[str, Any], str]]] = defaultdict(list)
+        for item_index, arm, sample_index, text in flat_items:
+            answer = answers_by_flat_key[(int(item_index), str(arm), int(sample_index))]
+            answers_by_item_arm[(int(item_index), arm)].append((sample_index, answer, text))
         restored: Dict[int, Dict[int, Dict[str, Any]]] = defaultdict(dict)
         for item_index, item in enumerate(intervention_items):
-            intervened_answers = answers_by_item.get(item_index, [])
-            if not intervened_answers:
+            control_entries = sorted(answers_by_item_arm.get((item_index, "control"), []))
+            if not control_entries:
                 continue
             response_index = int(item["response_index"])
             original = original_answers[response_index]
+            factual_entries = sorted(answers_by_item_arm.get((item_index, "factual"), []))
+            if not factual_entries:
+                factual_entries = [
+                    (sample_index, original, str(group[response_index]["response_text"]))
+                    for sample_index in range(len(control_entries))
+                ]
+            if len(factual_entries) != len(control_entries):
+                raise RuntimeError(
+                    "paired RCPC verifier count mismatch for item {}: factual={} control={}".format(
+                        item_index, len(factual_entries), len(control_entries)
+                    )
+                )
+            factual_answers = [entry[1] for entry in factual_entries]
+            control_answers = [entry[1] for entry in control_entries]
+            factual_texts = [entry[2] for entry in factual_entries]
+            control_texts = [entry[2] for entry in control_entries]
+            factual_format_valid = [_has_strict_cot_format(text) for text in factual_texts]
+            control_format_valid = [_has_strict_cot_format(text) for text in control_texts]
             criterion_effects = {}
+            criterion_variances = {}
+            criterion_standard_errors = {}
+            criterion_paired_differences = {}
             for criterion_index, criterion in enumerate(criteria):
                 criterion_id = str(criterion["criterion_id"])
                 signed_weight = float(criterion.get("raw_weight", criterion.get("points", 1.0)))
-                original_judgement = bool(original["judgement"][criterion_index])
-                original_quality = _quality_value(original_judgement, signed_weight)
-                intervened_qualities = [
+                factual_qualities = [
                     _quality_value(bool(answer["judgement"][criterion_index]), signed_weight)
-                    for answer in intervened_answers
+                    for answer in factual_answers
                 ]
-                mean_intervened_quality = (
-                    sum(intervened_qualities) / len(intervened_qualities)
-                    if intervened_qualities
-                    else 0.0
-                )
-                if self.zero_criteria_on_format_error and not original_format_valid[response_index]:
-                    original_quality = 0.0
-                criterion_effects[criterion_id] = original_quality - mean_intervened_quality
-            intervened_scores = [float(answer["final_score"]) for answer in intervened_answers]
-            mean_intervened_score = (
-                sum(intervened_scores) / len(intervened_scores) if intervened_scores else 0.0
-            )
-            intervened_texts = item.get("texts")
-            if not isinstance(intervened_texts, list) or not intervened_texts:
-                intervened_texts = [str(item.get("text", ""))]
+                control_qualities = [
+                    _quality_value(bool(answer["judgement"][criterion_index]), signed_weight)
+                    for answer in control_answers
+                ]
+                if self.zero_criteria_on_format_error:
+                    factual_qualities = [
+                        value if factual_format_valid[index] else 0.0
+                        for index, value in enumerate(factual_qualities)
+                    ]
+                    control_qualities = [
+                        value if control_format_valid[index] else 0.0
+                        for index, value in enumerate(control_qualities)
+                    ]
+                stats = paired_effect_statistics(factual_qualities, control_qualities)
+                criterion_effects[criterion_id] = float(stats["effect"])
+                criterion_variances[criterion_id] = float(stats["estimator_variance"])
+                criterion_standard_errors[criterion_id] = float(stats["standard_error"])
+                criterion_paired_differences[criterion_id] = list(stats["paired_differences"])
+            factual_scores = [float(answer["final_score"]) for answer in factual_answers]
+            control_scores = [float(answer["final_score"]) for answer in control_answers]
+            if self.zero_score_on_format_error:
+                factual_scores = [
+                    value if factual_format_valid[index] else 0.0
+                    for index, value in enumerate(factual_scores)
+                ]
+                control_scores = [
+                    value if control_format_valid[index] else 0.0
+                    for index, value in enumerate(control_scores)
+                ]
+            score_stats = paired_effect_statistics(factual_scores, control_scores)
+            mean_factual_score = sum(factual_scores) / len(factual_scores)
+            mean_control_score = sum(control_scores) / len(control_scores)
             restored[item["batch_index"]][int(item["block_index"])] = {
                 "response_index": response_index,
                 "batch_index": int(item["batch_index"]),
                 "block_index": int(item["block_index"]),
                 "block": item["block"],
-                "intervened_text": str(item.get("text", "")),
-                "intervened_texts": [str(text) for text in intervened_texts],
-                "counterfactual_sample_count": len(intervened_answers),
+                "factual_text": factual_texts[0] if factual_texts else "",
+                "factual_texts": factual_texts,
+                "control_text": control_texts[0] if control_texts else "",
+                "control_texts": control_texts,
+                "intervened_text": control_texts[0] if control_texts else "",
+                "intervened_texts": control_texts,
+                "factual_sample_count": len(factual_answers),
+                "control_sample_count": len(control_answers),
+                "counterfactual_sample_count": len(control_answers),
                 "criterion_effects": criterion_effects,
+                "criterion_variances": criterion_variances,
+                "criterion_standard_errors": criterion_standard_errors,
+                "criterion_paired_differences": criterion_paired_differences,
                 "original_score": float(original["final_score"]),
-                "intervened_score": mean_intervened_score,
-                "intervened_scores": intervened_scores,
-                "score_effect": float(original["final_score"]) - mean_intervened_score,
+                "factual_score": mean_factual_score,
+                "factual_scores": factual_scores,
+                "control_score": mean_control_score,
+                "control_scores": control_scores,
+                "intervened_score": mean_control_score,
+                "intervened_scores": control_scores,
+                "score_effect": float(score_stats["effect"]),
+                "score_effect_variance": float(score_stats["estimator_variance"]),
+                "score_effect_standard_error": float(score_stats["standard_error"]),
             }
         return {int(batch_index): dict(value) for batch_index, value in restored.items()}
 

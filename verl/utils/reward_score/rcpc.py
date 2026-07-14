@@ -1,9 +1,8 @@
 """Utilities for RCPC action anchoring and span-level credit shaping.
 
 This module is intentionally model-agnostic. It consumes a decoded response,
-the generated response token ids, and a per-token uncertainty signal. In the
-training pipeline the uncertainty signal is usually `-old_log_prob`, because
-vLLM generation logits are not kept in the rollout batch.
+the generated response token ids, and the policy's per-token entropy computed
+while old log probabilities are recomputed.
 """
 
 import math
@@ -409,6 +408,71 @@ def build_candidates(
     }
 
 
+def build_group_candidates(
+    responses: Sequence[Mapping[str, Any]],
+    *,
+    top_actions: int,
+    top_blocks: int,
+    min_action_chars: int,
+    max_action_chars: int,
+    max_action_tokens: int,
+    min_robust_denom: float,
+    min_anchor_z: float,
+) -> List[Dict[str, Any]]:
+    """Build one candidate pool shared by every trajectory in a prompt group.
+
+    Robust entropy normalization remains response-local, but the Top-K action
+    and block caps are applied once to the complete group. This keeps a method
+    budget ``B_group`` from accidentally becoming ``B_group`` per response.
+    """
+    outputs: List[Dict[str, Any]] = []
+    ranked_actions: List[Tuple[float, int, Mapping[str, Any]]] = []
+    for response_index, response in enumerate(responses):
+        actions = score_actions(
+            str(response.get("response_text", "")),
+            response.get("response_token_offsets") or [],
+            response.get("response_token_entropies") or [],
+            min_action_chars=min_action_chars,
+            max_action_chars=max_action_chars,
+            max_action_tokens=max_action_tokens,
+            min_robust_denom=min_robust_denom,
+        )
+        outputs.append({"actions": actions, "top_actions": [], "candidate_blocks": []})
+        for action in actions:
+            ranked_actions.append(
+                (float(action["uncertainty_robust_z"]), response_index, action)
+            )
+
+    ranked_actions.sort(key=lambda item: item[0], reverse=True)
+    selected_actions = ranked_actions[: max(0, int(top_actions))]
+    selected_ids_by_response: Dict[int, List[int]] = {}
+    for _score, response_index, action in selected_actions:
+        selected_ids_by_response.setdefault(response_index, []).append(int(action["action_index"]))
+        outputs[response_index]["top_actions"].append(action)
+
+    ranked_blocks: List[Tuple[float, int, Dict[str, Any]]] = []
+    for response_index, output in enumerate(outputs):
+        actions = output["actions"]
+        candidate_action_ids = selected_ids_by_response.get(response_index, [])
+        if not actions or not candidate_action_ids:
+            continue
+        response_blocks = aggregate_blocks(
+            actions,
+            candidate_action_ids,
+            top_blocks=len(actions),
+            min_anchor_z=min_anchor_z,
+        )
+        for block in response_blocks:
+            ranked_blocks.append(
+                (float(block.get("anchor_robust_z", 0.0)), response_index, block)
+            )
+
+    ranked_blocks.sort(key=lambda item: item[0], reverse=True)
+    for _score, response_index, block in ranked_blocks[: max(0, int(top_blocks))]:
+        outputs[response_index]["candidate_blocks"].append(block)
+    return outputs
+
+
 def apply_intervention(response_text: str, block: Mapping[str, Any], mode: str) -> str:
     char_start = int(block.get("char_start", -1))
     char_end = int(block.get("char_end", -1))
@@ -428,6 +492,35 @@ def _sample_variance(values: Sequence[float]) -> float:
         return 0.0
     mean = sum(values) / len(values)
     return sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+
+
+def paired_effect_statistics(
+    factual_values: Sequence[float],
+    control_values: Sequence[float],
+) -> Dict[str, Any]:
+    """Estimate a paired factual-minus-control effect and its uncertainty."""
+    if len(factual_values) != len(control_values):
+        raise ValueError(
+            "paired RCPC samples must have equal sizes: factual={} control={}".format(
+                len(factual_values), len(control_values)
+            )
+        )
+    if not factual_values:
+        raise ValueError("paired RCPC effect requires at least one sample per arm")
+    paired_differences = [
+        float(factual) - float(control)
+        for factual, control in zip(factual_values, control_values)
+    ]
+    effect = sum(paired_differences) / len(paired_differences)
+    sample_variance = _sample_variance(paired_differences)
+    estimator_variance = sample_variance / len(paired_differences)
+    return {
+        "effect": effect,
+        "paired_differences": paired_differences,
+        "sample_variance": sample_variance,
+        "estimator_variance": estimator_variance,
+        "standard_error": math.sqrt(max(0.0, estimator_variance)),
+    }
 
 
 def _softmax_from_log_weights(log_weights: Sequence[float]) -> List[float]:
@@ -521,26 +614,29 @@ def _calibrate_causal_potentials(
     *,
     blocks: Sequence[Mapping[str, Any]],
     intervention_effects: Optional[Mapping[int, Mapping[str, Any]]],
-    noise_floor: float,
     eps: float,
 ) -> Tuple[Dict[int, Dict[str, float]], Dict[str, float]]:
-    """Noise-aware empirical-Bayes calibration of local causal effects.
+    """Calibrate paired effects using their own estimator uncertainty.
 
-    Current training code estimates local effects by masking/removing a block
-    and asking the verifier to rescore the answer. That gives a deletion-effect
-    proxy for tau. When future prefix-rollout estimates are added, the same
-    interface can pass per-block/per-criterion variances in `criterion_variances`.
+    No across-block variance is used: equal non-zero effects must remain
+    informative rather than being collapsed to zero. The reliability factor is
+    an effect-to-uncertainty ratio computed independently for each block and
+    criterion.
     """
     if not intervention_effects:
         return {}, {
             "rcpc/calibrated_effect_abs_mean": 0.0,
-            "rcpc/shrinkage_mean": 0.0,
-            "rcpc/effect_signal_variance_mean": 0.0,
-            "rcpc/effect_noise_mean": 0.0,
+            "rcpc/effect_reliability_mean": 0.0,
+            "rcpc/effect_nonzero_ratio": 0.0,
+            "rcpc/effect_standard_error_mean": 0.0,
         }
 
     block_indices = {int(block.get("block_index", -1)) for block in blocks}
-    by_criterion: Dict[str, List[Tuple[int, float, float]]] = {}
+    calibrated: Dict[int, Dict[str, float]] = {}
+    abs_values = []
+    reliabilities = []
+    standard_errors = []
+    raw_nonzero = []
     for block_index, payload in intervention_effects.items():
         block_index = int(block_index)
         if block_index not in block_indices:
@@ -550,40 +646,28 @@ def _calibrate_causal_potentials(
         for criterion_id, raw_effect in criterion_effects.items():
             criterion_id = str(criterion_id)
             tau_hat = float(raw_effect)
-            variance = float(criterion_variances.get(criterion_id, noise_floor))
-            by_criterion.setdefault(criterion_id, []).append((block_index, tau_hat, max(0.0, variance)))
-
-    calibrated: Dict[int, Dict[str, float]] = {}
-    abs_values = []
-    shrinkages = []
-    signal_variances = []
-    noise_values = []
-
-    for criterion_id, entries in by_criterion.items():
-        tau_values = [entry[1] for entry in entries]
-        noise = [entry[2] for entry in entries]
-        observed_variance = _sample_variance(tau_values)
-        mean_noise = sum(noise) / len(noise) if noise else 0.0
-        signal_variance = max(0.0, observed_variance - mean_noise)
-        scale = math.sqrt(max(observed_variance, 0.0)) + eps
-        signal_variances.append(signal_variance)
-        noise_values.append(mean_noise)
-
-        for block_index, tau_hat, variance in entries:
-            shrinkage = signal_variance / (signal_variance + variance + eps)
-            tau_eb = shrinkage * tau_hat
-            tau_bar = math.tanh(tau_eb / scale) if signal_variance > 0.0 else 0.0
+            variance = max(0.0, float(criterion_variances.get(criterion_id, 0.0)))
+            signal_power = tau_hat * tau_hat
+            if signal_power <= eps and variance <= eps:
+                reliability = 0.0
+            else:
+                reliability = signal_power / (signal_power + variance + eps)
+            tau_bar = max(-1.0, min(1.0, tau_hat)) * reliability
             calibrated.setdefault(block_index, {})[criterion_id] = tau_bar
             abs_values.append(abs(tau_bar))
-            shrinkages.append(shrinkage)
+            reliabilities.append(reliability)
+            standard_errors.append(math.sqrt(variance))
+            raw_nonzero.append(1.0 if abs(tau_hat) > eps else 0.0)
 
     metrics = {
         "rcpc/calibrated_effect_abs_mean": sum(abs_values) / len(abs_values) if abs_values else 0.0,
-        "rcpc/shrinkage_mean": sum(shrinkages) / len(shrinkages) if shrinkages else 0.0,
-        "rcpc/effect_signal_variance_mean": (
-            sum(signal_variances) / len(signal_variances) if signal_variances else 0.0
+        "rcpc/effect_reliability_mean": (
+            sum(reliabilities) / len(reliabilities) if reliabilities else 0.0
         ),
-        "rcpc/effect_noise_mean": sum(noise_values) / len(noise_values) if noise_values else 0.0,
+        "rcpc/effect_nonzero_ratio": sum(raw_nonzero) / len(raw_nonzero) if raw_nonzero else 0.0,
+        "rcpc/effect_standard_error_mean": (
+            sum(standard_errors) / len(standard_errors) if standard_errors else 0.0
+        ),
     }
     return calibrated, metrics
 
@@ -598,24 +682,33 @@ def build_token_advantages(
     intervention_effects: Optional[Mapping[int, Mapping[str, Any]]] = None,
     fallback_to_full_response: bool = True,
     transport_lambda: float = 1.0,
-    effect_noise_floor: float = 0.05,
     eps: float = 1e-6,
 ) -> Tuple[List[float], Dict[str, float]]:
     length = max(0, int(response_length))
     token_advantages = [0.0] * length
     if length <= 0:
         return token_advantages, {
+            "rcpc/candidate_block_count": 0.0,
             "rcpc/nonzero_blocks": 0.0,
             "rcpc/token_coverage": 0.0,
             "rcpc/transport_lambda": float(transport_lambda),
             "rcpc/conservation_error": 0.0,
+            "rcpc/advantage_delta_abs_mean": 0.0,
+            "rcpc/advantage_delta_l1_ratio": 0.0,
+            "rcpc/advantage_cosine_to_baseline": 1.0,
+            "rcpc/transport_kl": 0.0,
+            "rcpc/candidate_multiplier_mean": 1.0,
+            "rcpc/background_multiplier_mean": 1.0,
+            "rcpc/calibrated_effect_abs_mean": 0.0,
+            "rcpc/effect_reliability_mean": 0.0,
+            "rcpc/effect_nonzero_ratio": 0.0,
+            "rcpc/effect_standard_error_mean": 0.0,
         }
 
     units = _build_transport_units(length, blocks)
     calibrated_effects, calibration_metrics = _calibrate_causal_potentials(
         blocks=blocks,
         intervention_effects=intervention_effects,
-        noise_floor=max(0.0, float(effect_noise_floor)),
         eps=eps,
     )
     if intervention_effects:
@@ -636,10 +729,19 @@ def build_token_advantages(
         if fallback_to_full_response:
             token_advantages = [float(combined_advantage)] * length
         return token_advantages, {
+            "rcpc/candidate_block_count": float(
+                sum(1 for unit in units if unit.get("kind") == "candidate")
+            ),
             "rcpc/nonzero_blocks": 0.0,
             "rcpc/token_coverage": 1.0 if fallback_to_full_response else 0.0,
             "rcpc/transport_lambda": float(transport_lambda),
             "rcpc/conservation_error": 0.0,
+            "rcpc/advantage_delta_abs_mean": 0.0,
+            "rcpc/advantage_delta_l1_ratio": 0.0,
+            "rcpc/advantage_cosine_to_baseline": 1.0,
+            "rcpc/transport_kl": 0.0,
+            "rcpc/candidate_multiplier_mean": 1.0,
+            "rcpc/background_multiplier_mean": 1.0,
             **calibration_metrics,
         }
 
@@ -648,6 +750,9 @@ def build_token_advantages(
     total_unit_tokens = sum(unit_lengths)
     base_distribution = [unit_length / total_unit_tokens for unit_length in unit_lengths]
     causal_units = 0
+    transport_kls = []
+    candidate_multipliers = []
+    background_multipliers = []
 
     for criterion_id, criterion_advantage, points in active_criteria:
         alpha = points / point_total if point_total > 0.0 else 1.0 / len(active_criteria)
@@ -663,6 +768,23 @@ def build_token_advantages(
             log_weights.append(math.log(max(base_mass, eps)) + float(transport_lambda) * sign * tau_bar)
 
         transported_distribution = _softmax_from_log_weights(log_weights)
+        transport_kls.append(
+            sum(
+                transported_mass * math.log(max(transported_mass, eps) / max(base_mass, eps))
+                for base_mass, transported_mass in zip(base_distribution, transported_distribution)
+            )
+        )
+        for kind in ("candidate", "background"):
+            indices = [index for index, unit in enumerate(units) if unit.get("kind") == kind]
+            base_total = sum(base_distribution[index] for index in indices)
+            if base_total <= 0.0:
+                continue
+            transported_total = sum(transported_distribution[index] for index in indices)
+            multiplier = transported_total / base_total
+            if kind == "candidate":
+                candidate_multipliers.append(multiplier)
+            else:
+                background_multipliers.append(multiplier)
         for unit, base_mass, transported_mass in zip(units, base_distribution, transported_distribution):
             if base_mass <= 0.0:
                 continue
@@ -688,12 +810,43 @@ def build_token_advantages(
         if unit.get("kind") == "candidate":
             covered_tokens.update(range(int(unit["token_start"]), int(unit["token_end"]) + 1))
     coverage = len(covered_tokens) / len(token_advantages) if token_advantages else 0.0
+    baseline_advantages = [target_advantage] * len(token_advantages)
+    advantage_deltas = [
+        value - baseline
+        for value, baseline in zip(token_advantages, baseline_advantages)
+    ]
+    delta_abs_mean = sum(abs(value) for value in advantage_deltas) / len(advantage_deltas)
+    baseline_l1 = sum(abs(value) for value in baseline_advantages)
+    delta_l1_ratio = sum(abs(value) for value in advantage_deltas) / max(baseline_l1, eps)
+    dot = sum(value * baseline for value, baseline in zip(token_advantages, baseline_advantages))
+    value_norm = math.sqrt(sum(value * value for value in token_advantages))
+    baseline_norm = math.sqrt(sum(value * value for value in baseline_advantages))
+    if value_norm <= eps or baseline_norm <= eps:
+        cosine = 1.0 if delta_abs_mean <= eps else 0.0
+    else:
+        cosine = max(-1.0, min(1.0, dot / (value_norm * baseline_norm)))
+    nonzero_block_indices = {
+        int(block_index)
+        for block_index, criterion_map in calibrated_effects.items()
+        if any(abs(float(value)) > eps for value in criterion_map.values())
+    }
     metrics = {
-        "rcpc/nonzero_blocks": float(sum(1 for unit in units if unit.get("kind") == "candidate")),
+        "rcpc/candidate_block_count": float(sum(1 for unit in units if unit.get("kind") == "candidate")),
+        "rcpc/nonzero_blocks": float(len(nonzero_block_indices)),
         "rcpc/token_coverage": float(coverage),
         "rcpc/causal_units": float(causal_units),
         "rcpc/transport_lambda": float(transport_lambda),
         "rcpc/conservation_error": float(conservation_error),
+        "rcpc/advantage_delta_abs_mean": float(delta_abs_mean),
+        "rcpc/advantage_delta_l1_ratio": float(delta_l1_ratio),
+        "rcpc/advantage_cosine_to_baseline": float(cosine),
+        "rcpc/transport_kl": sum(transport_kls) / len(transport_kls) if transport_kls else 0.0,
+        "rcpc/candidate_multiplier_mean": (
+            sum(candidate_multipliers) / len(candidate_multipliers) if candidate_multipliers else 1.0
+        ),
+        "rcpc/background_multiplier_mean": (
+            sum(background_multipliers) / len(background_multipliers) if background_multipliers else 1.0
+        ),
         **calibration_metrics,
     }
     return token_advantages, metrics

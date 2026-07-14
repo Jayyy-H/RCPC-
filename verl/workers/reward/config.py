@@ -94,16 +94,15 @@ class RewardConfig:
     ropd_rcpc_intervention_max_blocks_per_group: int = 32
     ropd_rcpc_intervention_mode: str = "mask"
     ropd_rcpc_batch_counterfactual: bool = True
-    # Number of prefix-regeneration samples per selected causal block. m=1 is
-    # the cheapest point estimate; m>1 averages counterfactual verifier scores.
-    ropd_rcpc_counterfactual_samples: int = 1
+    # Number of paired prefix-regeneration samples per arm and selected block.
+    # m=2 estimates both the paired effect and its sampling uncertainty.
+    ropd_rcpc_counterfactual_samples: int = 2
     # Prefix-regeneration counterfactuals are generated batch-wide. <=0 means
     # one request for all counterfactuals, which avoids repeated vLLM
     # wake/sync/sleep cycles; set a positive value only if the single request is
     # too large for the runtime.
     ropd_rcpc_counterfactual_batch_size: int = 0
     ropd_rcpc_transport_lambda: float = 1.0
-    ropd_rcpc_effect_noise_floor: float = 0.05
     ropd_rcpc_fallback_to_criterion_advantage: bool = True
     ropd_print_rcpc_outputs: bool = False
     ropd_rcpc_print_intervention_summary: bool = True

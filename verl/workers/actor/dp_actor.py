@@ -277,7 +277,7 @@ class DataParallelPPOActor(BasePPOActor):
         return grad_norm
 
     @torch.no_grad()
-    def compute_log_prob(self, data: DataProto) -> torch.Tensor:
+    def compute_log_prob(self, data: DataProto) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -293,7 +293,8 @@ class DataParallelPPOActor(BasePPOActor):
                 ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
 
         Returns:
-            torch.Tensor: the log_prob tensor
+            Tuple[torch.Tensor, torch.Tensor]: log probabilities and true
+            distribution entropy for every generated response token.
         """
         self.actor_module.eval()
 
@@ -311,16 +312,20 @@ class DataParallelPPOActor(BasePPOActor):
             self.config.micro_batch_size_per_device_for_experience
         )
         log_probs_lst = []
+        entropy_lst = []
         for micro_batch in tqdm(micro_batches, desc="Compute log probs", disable=(self.rank != 0)):
             micro_batch.to("cuda")
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             self._validate_actor_micro_batch(model_inputs, stage="compute_log_prob")
-            _, log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
+            entropy, log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
             self._validate_finite_tensor("compute_log_prob.log_probs", log_probs, stage="compute_log_prob")
+            self._validate_finite_tensor("compute_log_prob.entropy", entropy, stage="compute_log_prob")
             log_probs_lst.append(log_probs)
+            entropy_lst.append(entropy)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
-        return log_probs
+        token_entropies = torch.concat(entropy_lst, dim=0)
+        return log_probs, token_entropies
 
     def update_policy(self, data: DataProto) -> Dict[str, Any]:
         self.actor_module.train()
