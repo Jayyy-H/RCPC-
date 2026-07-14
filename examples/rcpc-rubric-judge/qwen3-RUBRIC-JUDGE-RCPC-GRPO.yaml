@@ -120,6 +120,9 @@ worker:
     ropd_rcpc_batch_counterfactual: true
     ropd_rcpc_counterfactual_samples: 2
     ropd_rcpc_counterfactual_batch_size: 128
+    ropd_rcpc_verifier_batch_size: 16
+    ropd_rcpc_verifier_max_retries: 2
+    ropd_rcpc_fail_on_intervention_error: true
     ropd_rcpc_transport_lambda: 1.0
     ropd_rcpc_fallback_to_criterion_advantage: true
     ropd_print_rcpc_outputs: false
