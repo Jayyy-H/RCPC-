@@ -55,7 +55,6 @@ VAL_GENERATIONS_TO_LOG_TO_WANDB="${VAL_GENERATIONS_TO_LOG_TO_WANDB:-10}"
 RCPC_BUDGET="${RCPC_BUDGET:-32}"
 RCPC_DERIVE_CANDIDATES_FROM_BUDGET="${RCPC_DERIVE_CANDIDATES_FROM_BUDGET:-true}"
 RCPC_TRANSPORT_LAMBDA="${RCPC_TRANSPORT_LAMBDA:-1.0}"
-RCPC_EFFECT_NOISE_FLOOR="${RCPC_EFFECT_NOISE_FLOOR:-0.05}"
 RCPC_INTERVENTION_MAX_GROUPS_PER_BATCH="${RCPC_INTERVENTION_MAX_GROUPS_PER_BATCH:--1}"
 RCPC_BATCH_COUNTERFACTUAL="${RCPC_BATCH_COUNTERFACTUAL:-true}"
 RCPC_COUNTERFACTUAL_SAMPLES="${RCPC_COUNTERFACTUAL_SAMPLES:-2}"
@@ -152,7 +151,6 @@ python3 -m verl.trainer.main \
     worker.reward.ropd_rcpc_budget="${RCPC_BUDGET}" \
     worker.reward.ropd_rcpc_derive_candidates_from_budget="${RCPC_DERIVE_CANDIDATES_FROM_BUDGET}" \
     worker.reward.ropd_rcpc_transport_lambda="${RCPC_TRANSPORT_LAMBDA}" \
-    worker.reward.ropd_rcpc_effect_noise_floor="${RCPC_EFFECT_NOISE_FLOOR}" \
     worker.reward.ropd_rcpc_intervention_max_groups_per_batch="${RCPC_INTERVENTION_MAX_GROUPS_PER_BATCH}" \
     worker.reward.ropd_rcpc_batch_counterfactual="${RCPC_BATCH_COUNTERFACTUAL}" \
     worker.reward.ropd_rcpc_counterfactual_samples="${RCPC_COUNTERFACTUAL_SAMPLES}" \
