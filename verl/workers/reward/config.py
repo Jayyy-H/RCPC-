@@ -97,10 +97,11 @@ class RewardConfig:
     # Number of prefix-regeneration samples per selected causal block. m=1 is
     # the cheapest point estimate; m>1 averages counterfactual verifier scores.
     ropd_rcpc_counterfactual_samples: int = 1
-    # Prefix-regeneration counterfactuals are generated batch-wide and then
-    # chunked to keep vLLM/Ray overhead low without creating an oversized
-    # single inference request. <=0 means one request for all counterfactuals.
-    ropd_rcpc_counterfactual_batch_size: int = 128
+    # Prefix-regeneration counterfactuals are generated batch-wide. <=0 means
+    # one request for all counterfactuals, which avoids repeated vLLM
+    # wake/sync/sleep cycles; set a positive value only if the single request is
+    # too large for the runtime.
+    ropd_rcpc_counterfactual_batch_size: int = 0
     ropd_rcpc_transport_lambda: float = 1.0
     ropd_rcpc_effect_noise_floor: float = 0.05
     ropd_rcpc_fallback_to_criterion_advantage: bool = True
