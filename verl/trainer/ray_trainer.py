@@ -761,7 +761,9 @@ class RayPPOTrainer:
         generated_texts = []
         for row_index in range(response_ids.shape[0]):
             valid_length = int(response_mask[row_index].sum().item())
-            suffix_ids = response_ids[row_index][:valid_length]
+            requested_length = max(1, int(requested_new_tokens[row_index]))
+            suffix_length = min(valid_length, requested_length)
+            suffix_ids = response_ids[row_index][:suffix_length]
             suffix_text = self.tokenizer.decode(
                 suffix_ids,
                 skip_special_tokens=True,
