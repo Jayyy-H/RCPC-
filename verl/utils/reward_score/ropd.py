@@ -456,7 +456,7 @@ class RopdIPRRewardScorer:
             1, int(_cfg(reward_config, "ropd_rcpc_counterfactual_samples", 1))
         )
         self.rcpc_counterfactual_batch_size = int(
-            _cfg(reward_config, "ropd_rcpc_counterfactual_batch_size", 128)
+            _cfg(reward_config, "ropd_rcpc_counterfactual_batch_size", 0)
         )
         self.rcpc_transport_lambda = float(_cfg(reward_config, "ropd_rcpc_transport_lambda", 1.0))
         self.rcpc_effect_noise_floor = float(_cfg(reward_config, "ropd_rcpc_effect_noise_floor", 0.05))
@@ -683,6 +683,18 @@ class RopdIPRRewardScorer:
         metrics["rcpc/intervention_item_count"] = float(len(all_items))
         requested_samples = len(all_items) * self.rcpc_counterfactual_samples
         metrics["rcpc/counterfactual_requested_samples"] = float(requested_samples)
+        requested_new_tokens = [
+            float(item.get("max_new_tokens", 0) or 0.0)
+            for item in all_items
+        ]
+        metrics["rcpc/counterfactual_max_new_tokens_mean"] = (
+            sum(requested_new_tokens) / len(requested_new_tokens)
+            if requested_new_tokens
+            else 0.0
+        )
+        metrics["rcpc/counterfactual_max_new_tokens_max"] = (
+            max(requested_new_tokens) if requested_new_tokens else 0.0
+        )
         if self.rcpc_counterfactual_batch_size > 0 and requested_samples > 0:
             metrics["rcpc/counterfactual_generation_chunks"] = float(
                 (requested_samples + self.rcpc_counterfactual_batch_size - 1)
@@ -1124,6 +1136,9 @@ class RopdIPRRewardScorer:
             for item in result["rubric"]["rubrics"]
         }
         for response_index, (info, candidate) in enumerate(zip(group, candidates)):
+            format_valid = result.get("student_format_valid") or []
+            if response_index < len(format_valid) and not bool(format_valid[response_index]):
+                continue
             criterion_advantages = self._criterion_advantages_for_response(result, response_index)
             point_total = sum(max(0.0, value) for value in criterion_points.values())
             response_advantage_scale = 0.0
@@ -1207,9 +1222,27 @@ class RopdIPRRewardScorer:
                 if batch_size <= 0:
                     generated_answers = self._counterfactual_generator(expanded_items)
                 else:
-                    for start in range(0, len(expanded_items), batch_size):
-                        chunk = expanded_items[start : start + batch_size]
-                        generated_answers.extend(self._counterfactual_generator(chunk))
+                    generated_by_index: Dict[int, str] = {}
+                    indexed_items = list(enumerate(expanded_items))
+                    indexed_items.sort(
+                        key=lambda pair: int(pair[1].get("max_new_tokens", 0) or 0)
+                    )
+                    for start in range(0, len(indexed_items), batch_size):
+                        chunk_pairs = indexed_items[start : start + batch_size]
+                        chunk = [item for _original_index, item in chunk_pairs]
+                        chunk_answers = self._counterfactual_generator(chunk)
+                        if len(chunk_answers) != len(chunk):
+                            raise RuntimeError(
+                                "counterfactual generator returned {} answers for chunk size {}".format(
+                                    len(chunk_answers), len(chunk)
+                                )
+                            )
+                        for (original_index, _item), answer in zip(chunk_pairs, chunk_answers):
+                            generated_by_index[int(original_index)] = str(answer)
+                    generated_answers = [
+                        generated_by_index[index]
+                        for index in range(len(expanded_items))
+                    ]
             if len(generated_answers) != len(expanded_items):
                 raise RuntimeError(
                     "counterfactual generator returned {} answers for {} intervention items".format(
