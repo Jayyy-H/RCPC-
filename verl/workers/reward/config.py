@@ -102,6 +102,14 @@ class RewardConfig:
     # wake/sync/sleep cycles; set a positive value only if the single request is
     # too large for the runtime.
     ropd_rcpc_counterfactual_batch_size: int = 0
+    # Bound each LLM-as-judge request independently from counterfactual
+    # generation batching. Large verifier payloads are more likely to return
+    # incomplete structured output.
+    ropd_rcpc_verifier_batch_size: int = 16
+    ropd_rcpc_verifier_max_retries: int = 2
+    # Production RCPC runs should fail visibly instead of silently reverting to
+    # baseline token advantages when an intervention plan cannot be scored.
+    ropd_rcpc_fail_on_intervention_error: bool = False
     ropd_rcpc_transport_lambda: float = 1.0
     ropd_rcpc_fallback_to_criterion_advantage: bool = True
     ropd_print_rcpc_outputs: bool = False

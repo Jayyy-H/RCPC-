@@ -497,8 +497,15 @@ def _sample_variance(values: Sequence[float]) -> float:
 def paired_effect_statistics(
     factual_values: Sequence[float],
     control_values: Sequence[float],
+    *,
+    pair_validity: Optional[Sequence[bool]] = None,
 ) -> Dict[str, Any]:
-    """Estimate a paired factual-minus-control effect and its uncertainty."""
+    """Estimate a paired factual-minus-control effect and its uncertainty.
+
+    Invalid factual/control pairs are excluded instead of being converted into
+    semantic failures. This keeps malformed counterfactual generations from
+    creating a dense, artificial effect across every rubric criterion.
+    """
     if len(factual_values) != len(control_values):
         raise ValueError(
             "paired RCPC samples must have equal sizes: factual={} control={}".format(
@@ -507,19 +514,36 @@ def paired_effect_statistics(
         )
     if not factual_values:
         raise ValueError("paired RCPC effect requires at least one sample per arm")
+    if pair_validity is None:
+        pair_validity = [True] * len(factual_values)
+    elif len(pair_validity) != len(factual_values):
+        raise ValueError(
+            "paired RCPC validity mask must match sample size: validity={} samples={}".format(
+                len(pair_validity), len(factual_values)
+            )
+        )
     paired_differences = [
         float(factual) - float(control)
-        for factual, control in zip(factual_values, control_values)
+        for factual, control, valid in zip(factual_values, control_values, pair_validity)
+        if bool(valid)
     ]
-    effect = sum(paired_differences) / len(paired_differences)
-    sample_variance = _sample_variance(paired_differences)
-    estimator_variance = sample_variance / len(paired_differences)
+    if paired_differences:
+        effect = sum(paired_differences) / len(paired_differences)
+        sample_variance = _sample_variance(paired_differences)
+        estimator_variance = sample_variance / len(paired_differences)
+    else:
+        effect = 0.0
+        sample_variance = 0.0
+        estimator_variance = 0.0
     return {
         "effect": effect,
         "paired_differences": paired_differences,
         "sample_variance": sample_variance,
         "estimator_variance": estimator_variance,
         "standard_error": math.sqrt(max(0.0, estimator_variance)),
+        "total_pair_count": len(factual_values),
+        "valid_pair_count": len(paired_differences),
+        "invalid_pair_count": len(factual_values) - len(paired_differences),
     }
 
 

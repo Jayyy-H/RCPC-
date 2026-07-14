@@ -415,6 +415,16 @@ class FixedRubricRCPCRewardScorer(RopdIPRRewardScorer):
             control_texts = [entry[2] for entry in control_entries]
             factual_format_valid = [_has_strict_cot_format(text) for text in factual_texts]
             control_format_valid = [_has_strict_cot_format(text) for text in control_texts]
+            if self.require_strict_cot_format:
+                pair_format_valid = [
+                    factual_valid and control_valid
+                    for factual_valid, control_valid in zip(
+                        factual_format_valid,
+                        control_format_valid,
+                    )
+                ]
+            else:
+                pair_format_valid = [True] * len(factual_answers)
             criterion_effects = {}
             criterion_variances = {}
             criterion_standard_errors = {}
@@ -430,34 +440,38 @@ class FixedRubricRCPCRewardScorer(RopdIPRRewardScorer):
                     _quality_value(bool(answer["judgement"][criterion_index]), signed_weight)
                     for answer in control_answers
                 ]
-                if self.zero_criteria_on_format_error:
-                    factual_qualities = [
-                        value if factual_format_valid[index] else 0.0
-                        for index, value in enumerate(factual_qualities)
-                    ]
-                    control_qualities = [
-                        value if control_format_valid[index] else 0.0
-                        for index, value in enumerate(control_qualities)
-                    ]
-                stats = paired_effect_statistics(factual_qualities, control_qualities)
+                stats = paired_effect_statistics(
+                    factual_qualities,
+                    control_qualities,
+                    pair_validity=pair_format_valid,
+                )
                 criterion_effects[criterion_id] = float(stats["effect"])
                 criterion_variances[criterion_id] = float(stats["estimator_variance"])
                 criterion_standard_errors[criterion_id] = float(stats["standard_error"])
                 criterion_paired_differences[criterion_id] = list(stats["paired_differences"])
             factual_scores = [float(answer["final_score"]) for answer in factual_answers]
             control_scores = [float(answer["final_score"]) for answer in control_answers]
-            if self.zero_score_on_format_error:
-                factual_scores = [
-                    value if factual_format_valid[index] else 0.0
-                    for index, value in enumerate(factual_scores)
-                ]
-                control_scores = [
-                    value if control_format_valid[index] else 0.0
-                    for index, value in enumerate(control_scores)
-                ]
-            score_stats = paired_effect_statistics(factual_scores, control_scores)
-            mean_factual_score = sum(factual_scores) / len(factual_scores)
-            mean_control_score = sum(control_scores) / len(control_scores)
+            score_stats = paired_effect_statistics(
+                factual_scores,
+                control_scores,
+                pair_validity=pair_format_valid,
+            )
+            valid_factual_scores = [
+                value for value, valid in zip(factual_scores, pair_format_valid) if valid
+            ]
+            valid_control_scores = [
+                value for value, valid in zip(control_scores, pair_format_valid) if valid
+            ]
+            mean_factual_score = (
+                sum(valid_factual_scores) / len(valid_factual_scores)
+                if valid_factual_scores
+                else 0.0
+            )
+            mean_control_score = (
+                sum(valid_control_scores) / len(valid_control_scores)
+                if valid_control_scores
+                else 0.0
+            )
             restored[item["batch_index"]][int(item["block_index"])] = {
                 "response_index": response_index,
                 "batch_index": int(item["batch_index"]),
@@ -472,6 +486,11 @@ class FixedRubricRCPCRewardScorer(RopdIPRRewardScorer):
                 "factual_sample_count": len(factual_answers),
                 "control_sample_count": len(control_answers),
                 "counterfactual_sample_count": len(control_answers),
+                "factual_format_valid": factual_format_valid,
+                "control_format_valid": control_format_valid,
+                "pair_format_valid": pair_format_valid,
+                "valid_pair_count": int(score_stats["valid_pair_count"]),
+                "invalid_pair_count": int(score_stats["invalid_pair_count"]),
                 "criterion_effects": criterion_effects,
                 "criterion_variances": criterion_variances,
                 "criterion_standard_errors": criterion_standard_errors,
