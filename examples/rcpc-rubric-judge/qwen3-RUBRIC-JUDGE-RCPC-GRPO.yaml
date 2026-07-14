@@ -105,7 +105,7 @@ worker:
     ropd_rcpc_use_token_advantage: true
     # Canonical RCPC budget B_group. By default this single knob controls
     # candidate discovery and the number of prefix-regeneration interventions:
-    # effective_top_blocks = B_group, effective_top_actions = 2 * B_group,
+    # group-level top_blocks = B_group, group-level top_actions = 2 * B_group
     # max_intervention_blocks_per_group = B_group.
     ropd_rcpc_budget: 32
     ropd_rcpc_derive_candidates_from_budget: true
@@ -121,7 +121,6 @@ worker:
     ropd_rcpc_counterfactual_samples: 2
     ropd_rcpc_counterfactual_batch_size: 128
     ropd_rcpc_transport_lambda: 1.0
-    ropd_rcpc_effect_noise_floor: 0.05
     ropd_rcpc_fallback_to_criterion_advantage: true
     ropd_print_rcpc_outputs: false
     ropd_rcpc_print_intervention_summary: true
