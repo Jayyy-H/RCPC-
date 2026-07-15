@@ -51,12 +51,10 @@ class RewardConfig:
     ropd_print_rubric_outputs: bool = False
     ropd_print_verifier_outputs: bool = False
     ropd_require_strict_cot_format: bool = True
-    # Keep strict format as a measurable signal, but make the hard all-or-nothing
-    # gate explicit. Legacy ROPD keeps the old behavior by default; generic RCPC
-    # experiments can disable these gates so content/rubric reward still teaches
-    # the model while format is being bootstrapped.
-    ropd_zero_score_on_format_error: bool = True
-    ropd_zero_criteria_on_format_error: bool = True
+    # Keep strict format as a measurable signal without erasing semantic reward.
+    # Legacy all-or-nothing behavior remains available as an explicit override.
+    ropd_zero_score_on_format_error: bool = False
+    ropd_zero_criteria_on_format_error: bool = False
     ropd_final_label_points_cap: int = 1
     ropd_format_points_cap: int = 1
     ropd_max_image_bytes: int = 8388608
@@ -105,8 +103,17 @@ class RewardConfig:
     # Bound each LLM-as-judge request independently from counterfactual
     # generation batching. Large verifier payloads are more likely to return
     # incomplete structured output.
-    ropd_rcpc_verifier_batch_size: int = 16
+    ropd_rcpc_verifier_batch_size: int = 12
+    # The verifier packs factual/control pairs by both answer count and the
+    # rendered prompt token count. This leaves headroom for structured output
+    # under the 40k-context judge endpoints used by the training jobs.
+    ropd_rcpc_verifier_max_input_tokens: int = 28000
+    ropd_rcpc_verifier_min_output_tokens: int = 256
+    ropd_rcpc_verifier_output_tokens_per_answer: int = 160
     ropd_rcpc_verifier_max_retries: int = 2
+    # Weak variance floor on one paired outcome. The estimator divides it by
+    # the valid pair count, so uncertainty still decreases with more samples.
+    ropd_rcpc_effect_variance_prior: float = 0.1
     # Production RCPC runs should fail visibly instead of silently reverting to
     # baseline token advantages when an intervention plan cannot be scored.
     ropd_rcpc_fail_on_intervention_error: bool = False

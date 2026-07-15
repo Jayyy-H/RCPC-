@@ -499,6 +499,7 @@ def paired_effect_statistics(
     control_values: Sequence[float],
     *,
     pair_validity: Optional[Sequence[bool]] = None,
+    variance_prior: float = 0.0,
 ) -> Dict[str, Any]:
     """Estimate a paired factual-minus-control effect and its uncertainty.
 
@@ -531,6 +532,13 @@ def paired_effect_statistics(
         effect = sum(paired_differences) / len(paired_differences)
         sample_variance = _sample_variance(paired_differences)
         estimator_variance = sample_variance / len(paired_differences)
+        # A tiny paired sample can look spuriously certain when every observed
+        # difference is identical. Treat variance_prior as a weak prior on one
+        # paired outcome and use it only as a floor; it therefore vanishes as
+        # the number of valid pairs grows and never overwrites larger empirical
+        # uncertainty.
+        prior_floor = max(0.0, float(variance_prior)) / len(paired_differences)
+        estimator_variance = max(estimator_variance, prior_floor)
     else:
         effect = 0.0
         sample_variance = 0.0

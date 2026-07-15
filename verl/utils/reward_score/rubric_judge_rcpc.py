@@ -99,14 +99,14 @@ def _compute_fixed_group_criterion_advantages(
     verifier_answers: Sequence[Mapping[str, Any]],
     format_valid: Sequence[bool],
     *,
-    require_strict_cot_format: bool,
+    format_weight: float = 1.0,
     epsilon: float = 1e-6,
-) -> Tuple[List[float], Dict[str, Dict[str, List[float]]]]:
+) -> Tuple[List[float], Dict[str, Dict[str, Any]]]:
     rubrics = list(rubric["rubrics"])
     response_count = len(verifier_answers)
     combined = [0.0] * response_count
     active_weight = 0.0
-    criterion_stats: Dict[str, Dict[str, List[float]]] = {}
+    criterion_stats: Dict[str, Dict[str, Any]] = {}
 
     for criterion_index, criterion in enumerate(rubrics):
         signed_weight = float(criterion.get("raw_weight", criterion.get("points", 1.0)))
@@ -115,8 +115,6 @@ def _compute_fixed_group_criterion_advantages(
         for response_index, answer in enumerate(verifier_answers):
             judgement = bool(answer["judgement"][criterion_index])
             value = _quality_value(judgement, signed_weight)
-            if require_strict_cot_format and not format_valid[response_index]:
-                value = 0.0
             values.append(value)
 
         mean = sum(values) / len(values) if values else 0.0
@@ -134,7 +132,30 @@ def _compute_fixed_group_criterion_advantages(
             # criteria, 1 means the pitfall was avoided.
             "judgements": values,
             "advantages": advantages,
+            "points": point_weight,
         }
+
+    # XML/protocol compliance is an independent deterministic criterion. It
+    # must not erase judgeable semantic evidence from every task rubric.
+    format_values = [1.0 if bool(value) else 0.0 for value in format_valid]
+    format_mean = sum(format_values) / len(format_values) if format_values else 0.0
+    format_std = _sample_std(format_values)
+    format_weight = max(0.0, float(format_weight))
+    if format_std > epsilon and format_weight > 0.0:
+        format_advantages = [
+            (value - format_mean) / (format_std + epsilon)
+            for value in format_values
+        ]
+        active_weight += format_weight
+        for response_index, advantage in enumerate(format_advantages):
+            combined[response_index] += format_weight * advantage
+    else:
+        format_advantages = [0.0] * response_count
+    criterion_stats["format"] = {
+        "judgements": format_values,
+        "advantages": format_advantages,
+        "points": format_weight,
+    }
 
     if active_weight > 0.0:
         combined = [value / active_weight for value in combined]
@@ -234,7 +255,7 @@ class FixedRubricRCPCRewardScorer(RopdIPRRewardScorer):
                 rubric,
                 verifier_payload["answers"],
                 student_format_valid,
-                require_strict_cot_format=self.zero_criteria_on_format_error,
+                format_weight=float(self.format_points_cap),
             )
             scores = {
                 info["batch_index"]: normalized_scores[index]
@@ -365,36 +386,25 @@ class FixedRubricRCPCRewardScorer(RopdIPRRewardScorer):
         if not intervention_items:
             return {}
 
-        flat_items = []
-        for item_index, item in enumerate(intervention_items):
-            factual_texts = item.get("factual_texts")
-            control_texts = item.get("control_texts")
-            if isinstance(factual_texts, list) and isinstance(control_texts, list):
-                arm_texts = (("factual", factual_texts), ("control", control_texts))
-            else:
-                texts = item.get("texts")
-                if not isinstance(texts, list) or not texts:
-                    texts = [item.get("text", "")]
-                arm_texts = (("control", texts),)
-            for arm, texts in arm_texts:
-                for sample_index, text in enumerate(texts):
-                    flat_items.append((item_index, arm, sample_index, str(text)))
-        answers_by_flat_key = self._verify_rcpc_arm_entries(
+        flat_items = self._build_rcpc_verifier_flat_items(intervention_items)
+        answers_by_flat_key, verifier_metrics = self._verify_rcpc_arm_entries(
             first,
             result["rubric"],
             flat_items,
         )
+        if isinstance(result, dict):
+            result["rcpc_verifier_metrics"] = verifier_metrics
         original_answers = list(result["student_verifier_answers"])
         criteria = list(result["rubric"]["rubrics"])
         answers_by_item_arm: Dict[Tuple[int, str], List[Tuple[int, Mapping[str, Any], str]]] = defaultdict(list)
         for item_index, arm, sample_index, text in flat_items:
-            answer = answers_by_flat_key[(int(item_index), str(arm), int(sample_index))]
+            answer = answers_by_flat_key.get((int(item_index), str(arm), int(sample_index)))
+            if answer is None:
+                continue
             answers_by_item_arm[(int(item_index), arm)].append((sample_index, answer, text))
         restored: Dict[int, Dict[int, Dict[str, Any]]] = defaultdict(dict)
         for item_index, item in enumerate(intervention_items):
             control_entries = sorted(answers_by_item_arm.get((item_index, "control"), []))
-            if not control_entries:
-                continue
             response_index = int(item["response_index"])
             original = original_answers[response_index]
             factual_entries = sorted(answers_by_item_arm.get((item_index, "factual"), []))
@@ -403,28 +413,42 @@ class FixedRubricRCPCRewardScorer(RopdIPRRewardScorer):
                     (sample_index, original, str(group[response_index]["response_text"]))
                     for sample_index in range(len(control_entries))
                 ]
-            if len(factual_entries) != len(control_entries):
-                raise RuntimeError(
-                    "paired RCPC verifier count mismatch for item {}: factual={} control={}".format(
-                        item_index, len(factual_entries), len(control_entries)
-                    )
-                )
+            factual_by_sample = {int(entry[0]): entry for entry in factual_entries}
+            control_by_sample = {int(entry[0]): entry for entry in control_entries}
+            paired_sample_ids = sorted(set(factual_by_sample) & set(control_by_sample))
+            if not paired_sample_ids:
+                continue
+            factual_entries = [factual_by_sample[index] for index in paired_sample_ids]
+            control_entries = [control_by_sample[index] for index in paired_sample_ids]
             factual_answers = [entry[1] for entry in factual_entries]
             control_answers = [entry[1] for entry in control_entries]
             factual_texts = [entry[2] for entry in factual_entries]
             control_texts = [entry[2] for entry in control_entries]
             factual_format_valid = [_has_strict_cot_format(text) for text in factual_texts]
             control_format_valid = [_has_strict_cot_format(text) for text in control_texts]
-            if self.require_strict_cot_format:
-                pair_format_valid = [
-                    factual_valid and control_valid
-                    for factual_valid, control_valid in zip(
-                        factual_format_valid,
-                        control_format_valid,
-                    )
-                ]
-            else:
-                pair_format_valid = [True] * len(factual_answers)
+            pair_format_valid = [
+                factual_valid and control_valid
+                for factual_valid, control_valid in zip(
+                    factual_format_valid,
+                    control_format_valid,
+                )
+            ]
+            pair_semantic_valid = [True] * len(factual_answers)
+            source_pair_count = max(
+                len(item.get("factual_texts") or []),
+                len(item.get("control_texts") or []),
+                len(factual_answers),
+            )
+            factual_semantic_all = list(
+                item.get("factual_semantic_valid") or [True] * source_pair_count
+            )
+            control_semantic_all = list(
+                item.get("control_semantic_valid") or [True] * source_pair_count
+            )
+            all_pair_semantic_valid = [
+                bool(factual_semantic_all[index]) and bool(control_semantic_all[index])
+                for index in range(min(len(factual_semantic_all), len(control_semantic_all)))
+            ]
             criterion_effects = {}
             criterion_variances = {}
             criterion_standard_errors = {}
@@ -443,24 +467,39 @@ class FixedRubricRCPCRewardScorer(RopdIPRRewardScorer):
                 stats = paired_effect_statistics(
                     factual_qualities,
                     control_qualities,
-                    pair_validity=pair_format_valid,
+                    pair_validity=pair_semantic_valid,
+                    variance_prior=self.rcpc_effect_variance_prior,
                 )
                 criterion_effects[criterion_id] = float(stats["effect"])
                 criterion_variances[criterion_id] = float(stats["estimator_variance"])
                 criterion_standard_errors[criterion_id] = float(stats["standard_error"])
                 criterion_paired_differences[criterion_id] = list(stats["paired_differences"])
+            if "format" in result.get("criterion_stats", {}):
+                format_stats = paired_effect_statistics(
+                    [1.0 if valid else 0.0 for valid in factual_format_valid],
+                    [1.0 if valid else 0.0 for valid in control_format_valid],
+                    pair_validity=pair_semantic_valid,
+                    variance_prior=self.rcpc_effect_variance_prior,
+                )
+                criterion_effects["format"] = float(format_stats["effect"])
+                criterion_variances["format"] = float(format_stats["estimator_variance"])
+                criterion_standard_errors["format"] = float(format_stats["standard_error"])
+                criterion_paired_differences["format"] = list(
+                    format_stats["paired_differences"]
+                )
             factual_scores = [float(answer["final_score"]) for answer in factual_answers]
             control_scores = [float(answer["final_score"]) for answer in control_answers]
             score_stats = paired_effect_statistics(
                 factual_scores,
                 control_scores,
-                pair_validity=pair_format_valid,
+                pair_validity=pair_semantic_valid,
+                variance_prior=self.rcpc_effect_variance_prior,
             )
             valid_factual_scores = [
-                value for value, valid in zip(factual_scores, pair_format_valid) if valid
+                value for value, valid in zip(factual_scores, pair_semantic_valid) if valid
             ]
             valid_control_scores = [
-                value for value, valid in zip(control_scores, pair_format_valid) if valid
+                value for value, valid in zip(control_scores, pair_semantic_valid) if valid
             ]
             mean_factual_score = (
                 sum(valid_factual_scores) / len(valid_factual_scores)
@@ -489,6 +528,7 @@ class FixedRubricRCPCRewardScorer(RopdIPRRewardScorer):
                 "factual_format_valid": factual_format_valid,
                 "control_format_valid": control_format_valid,
                 "pair_format_valid": pair_format_valid,
+                "pair_semantic_valid": all_pair_semantic_valid,
                 "valid_pair_count": int(score_stats["valid_pair_count"]),
                 "invalid_pair_count": int(score_stats["invalid_pair_count"]),
                 "criterion_effects": criterion_effects,

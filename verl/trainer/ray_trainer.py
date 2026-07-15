@@ -717,7 +717,7 @@ class RayPPOTrainer:
             },
         )
 
-    def _generate_counterfactual_suffixes(self, requests) -> list[str]:
+    def _generate_counterfactual_suffixes(self, requests) -> list[dict]:
         if not requests:
             return []
         max_model_len = int(self.config.data.max_prompt_length + self.config.data.max_response_length)
@@ -764,7 +764,14 @@ class RayPPOTrainer:
         max_prompt_len = max(len(item) for item in prompt_id_lists)
         max_new_tokens = min(max(requested_new_tokens), max(1, max_model_len - max_prompt_len))
         if max_new_tokens <= 0:
-            return list(prefix_texts)
+            return [
+                {
+                    "text": prefix_text,
+                    "generated_token_count": 0,
+                    "clipped": False,
+                }
+                for prefix_text in prefix_texts
+            ]
 
         prompt_proto = self._build_text_only_prompt_proto(
             prompt_id_lists,
@@ -794,7 +801,13 @@ class RayPPOTrainer:
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
             )
-            generated_texts.append(prefix_texts[row_index] + suffix_text)
+            generated_texts.append(
+                {
+                    "text": prefix_texts[row_index] + suffix_text,
+                    "generated_token_count": valid_length,
+                    "clipped": valid_length >= max(1, requested_new_tokens[row_index] - 1),
+                }
+            )
         return generated_texts
 
     def _validate(self):
