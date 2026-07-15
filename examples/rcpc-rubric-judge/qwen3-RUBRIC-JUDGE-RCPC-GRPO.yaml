@@ -95,8 +95,8 @@ worker:
     # reward/criterion signal to zero while the SFT checkpoint is still learning
     # to close <reasoning> and emit <answer>. Otherwise reward becomes identically
     # zero and RCPC cannot select interventions.
-    ropd_zero_score_on_format_error: true
-    ropd_zero_criteria_on_format_error: true
+    ropd_zero_score_on_format_error: false
+    ropd_zero_criteria_on_format_error: false
     ropd_fallback_to_ipr: false
     ropd_score_offpolicy: false
     ropd_use_criterion_advantage: true
@@ -120,7 +120,11 @@ worker:
     ropd_rcpc_batch_counterfactual: true
     ropd_rcpc_counterfactual_samples: 2
     ropd_rcpc_counterfactual_batch_size: 128
-    ropd_rcpc_verifier_batch_size: 16
+    ropd_rcpc_verifier_batch_size: 12
+    ropd_rcpc_verifier_max_input_tokens: 28000
+    ropd_rcpc_verifier_min_output_tokens: 256
+    ropd_rcpc_verifier_output_tokens_per_answer: 160
+    ropd_rcpc_effect_variance_prior: 0.1
     ropd_rcpc_verifier_max_retries: 2
     ropd_rcpc_fail_on_intervention_error: true
     ropd_rcpc_transport_lambda: 1.0
