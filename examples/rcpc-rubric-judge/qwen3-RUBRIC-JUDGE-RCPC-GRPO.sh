@@ -3,7 +3,7 @@ set -euo pipefail
 
 # GPT-5.4 Responses gateway credential copied from the known-good data flywheel.
 # This assignment is intentionally before `set -x`, so its value is not echoed.
-GPT5_4_API_KEY_INLINE="AmfJ2xJ8ToUQ0Lk0tBPMCVgw50bdtwWu_GPT_AK"
+GPT5_4_API_KEY_INLINE=""
 JUDGE_MODEL="${JUDGE_MODEL:-gpt-5.4-2026-03-05}"
 if [[ -n "${GPT5_4_API_KEY_INLINE}" ]]; then
   JUDGE_API_KEY="${GPT5_4_API_KEY_INLINE}"
