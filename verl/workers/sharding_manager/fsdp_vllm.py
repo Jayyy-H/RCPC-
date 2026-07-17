@@ -39,10 +39,12 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         module: FSDP,
         inference_engine: LLM,
         device_mesh: DeviceMesh = None,
+        enable_prefix_caching: bool = False,
     ):
         self.module = module
         self.inference_engine = inference_engine
         self.device_mesh = device_mesh
+        self.enable_prefix_caching = bool(enable_prefix_caching)
         FSDP.set_state_dict_type(
             self.module,
             state_dict_type=StateDictType.SHARDED_STATE_DICT,
@@ -113,6 +115,19 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         else:
             load_dtensor_weights(actor_weights, vllm_model)
 
+    def _reset_prefix_cache_after_weight_sync(self):
+        if not self.enable_prefix_caching:
+            return
+        for target in (self.inference_engine, self.inference_engine.llm_engine):
+            reset = getattr(target, "reset_prefix_cache", None)
+            if callable(reset):
+                reset()
+                return
+        raise RuntimeError(
+            "vLLM prefix caching is enabled, but this vLLM version exposes no "
+            "reset_prefix_cache API after actor weight synchronization"
+        )
+
     def __enter__(self):
         self._maybe_sync_cuda()
         log_gpu_memory_usage("Before state_dict() in sharding manager")
@@ -123,6 +138,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.inference_engine.wake_up()
         self._maybe_sync_cuda()
         self._sync_weights_to_vllm(actor_weights)
+        self._reset_prefix_cache_after_weight_sync()
         self._maybe_sync_cuda()
         log_gpu_memory_usage("After sync model weights in sharding manager")
 

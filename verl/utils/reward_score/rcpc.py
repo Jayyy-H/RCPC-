@@ -8,6 +8,7 @@ while old log probabilities are recomputed.
 import math
 import re
 import statistics
+import unicodedata
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
@@ -16,13 +17,123 @@ _REASONING_BLOCK_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 _EDGE_STRUCTURAL_TAG_RE = re.compile(r"\s*</?(?:reasoning|think|answer)\b[^>]*>\s*", re.IGNORECASE)
+_KEY_CONTENT_TOKEN_RE = re.compile(
+    r"[a-z]+(?:['’-][a-z]+)*|\d+(?:\.\d+)?|[\u4e00-\u9fff]",
+    re.IGNORECASE,
+)
+_KEY_CONTENT_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "answer",
+        "are",
+        "as",
+        "at",
+        "be",
+        "because",
+        "but",
+        "by",
+        "check",
+        "conclude",
+        "finally",
+        "for",
+        "from",
+        "hence",
+        "however",
+        "if",
+        "in",
+        "is",
+        "it",
+        "let",
+        "next",
+        "now",
+        "of",
+        "on",
+        "or",
+        "result",
+        "so",
+        "step",
+        "substituting",
+        "than",
+        "that",
+        "the",
+        "then",
+        "therefore",
+        "this",
+        "thus",
+        "to",
+        "using",
+        "wait",
+        "we",
+        "which",
+        "with",
+    }
+)
+_FORMULA_FRAGMENT_RE = re.compile(
+    r"[a-z0-9.]+(?:\s*[=+*/^<>≈≠≤≥∝]\s*[a-z0-9.]+)+",
+    re.IGNORECASE,
+)
 
 
-def build_token_offsets(tokenizer: Any, token_ids: Sequence[int]) -> List[Tuple[int, int]]:
-    """Map generated token positions to character spans in decoded response text."""
+def build_token_offsets(
+    tokenizer: Any,
+    token_ids: Sequence[int],
+    decoded_text: Optional[str] = None,
+) -> List[Tuple[int, int]]:
+    """Map generated token positions to decoded character spans.
+
+    Fast tokenizers can recover all offsets in one linear pass. We only trust
+    that path when re-tokenization exactly reproduces the non-special token
+    ids; otherwise the original prefix-decoding implementation is retained as
+    a correctness-preserving fallback.
+    """
+    ids = [int(token_id) for token_id in token_ids]
+    if not ids:
+        return []
+
+    text = decoded_text
+    if text is None:
+        text = tokenizer.decode(
+            ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+    special_ids = {int(token_id) for token_id in getattr(tokenizer, "all_special_ids", [])}
+    content_ids = [token_id for token_id in ids if token_id not in special_ids]
+    try:
+        encoded = tokenizer(
+            text,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        encoded_ids = encoded["input_ids"]
+        encoded_offsets = encoded["offset_mapping"]
+        if encoded_ids and isinstance(encoded_ids[0], (list, tuple)):
+            encoded_ids = encoded_ids[0]
+            encoded_offsets = encoded_offsets[0]
+        encoded_ids = [int(token_id) for token_id in encoded_ids]
+        encoded_offsets = [tuple(map(int, offset)) for offset in encoded_offsets]
+        if encoded_ids == content_ids and len(encoded_offsets) == len(content_ids):
+            offsets: List[Tuple[int, int]] = []
+            content_index = 0
+            cursor = 0
+            for token_id in ids:
+                if token_id in special_ids:
+                    offsets.append((cursor, cursor))
+                    continue
+                start, end = encoded_offsets[content_index]
+                offsets.append((start, end))
+                cursor = end
+                content_index += 1
+            return offsets
+    except Exception:
+        pass
+
+    # Preserve historical behavior when decode/encode normalization is not
+    # exactly reversible.
     offsets: List[Tuple[int, int]] = []
     prev_text = ""
-    ids = [int(token_id) for token_id in token_ids]
     for index in range(len(ids)):
         prefix_text = tokenizer.decode(
             ids[: index + 1],
@@ -200,6 +311,86 @@ def _median_abs_deviation(values: Sequence[float]) -> float:
         return 0.0
     median = statistics.median(values)
     return statistics.median([abs(value - median) for value in values])
+
+
+def _compact_key_content(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).lower()
+    normalized = re.sub(r"</?(?:reasoning|think|answer)\b[^>]*>", " ", normalized)
+    return "".join(
+        char
+        for char in normalized
+        if char.isalnum() or "\u4e00" <= char <= "\u9fff" or char in "=+*/^<>≈≠≤≥∝√%"
+    )
+
+
+def _key_content_terms(text: str) -> List[str]:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).lower()
+    normalized = re.sub(r"</?(?:reasoning|think|answer)\b[^>]*>", " ", normalized)
+    terms: List[str] = []
+    seen = set()
+    for token in _KEY_CONTENT_TOKEN_RE.findall(normalized):
+        token = token.lower()
+        is_cjk = len(token) == 1 and "\u4e00" <= token <= "\u9fff"
+        is_number = token[0].isdigit()
+        if not is_cjk and not is_number:
+            if len(token) < 3 or token in _KEY_CONTENT_STOPWORDS:
+                continue
+        if token not in seen:
+            seen.add(token)
+            terms.append(token)
+
+    for match in _FORMULA_FRAGMENT_RE.finditer(normalized):
+        formula = _compact_key_content(match.group(0))
+        if len(formula) >= 3 and formula not in seen:
+            seen.add(formula)
+            terms.append(formula)
+    return terms
+
+
+def measure_deleted_content_reappearance(
+    deleted_text: str,
+    regenerated_suffix: str,
+    *,
+    min_key_term_recall: float = 0.6,
+) -> Dict[str, Any]:
+    """Measure conservative lexical reappearance of a deleted reasoning block.
+
+    This is intentionally a no-model diagnostic. It ignores generic reasoning
+    connectives, rewards an exact normalized phrase match, and otherwise
+    requires multiple content terms to reappear. Semantic paraphrases can be
+    missed, so the result should be interpreted as a lower-bound proxy for
+    prefix-regeneration self-repair rather than a semantic equivalence test.
+    """
+    source_terms = _key_content_terms(deleted_text)
+    target_terms = set(_key_content_terms(regenerated_suffix))
+    compact_source = _compact_key_content(deleted_text)
+    compact_target = _compact_key_content(regenerated_suffix)
+    exact_phrase_match = bool(
+        source_terms
+        and len(compact_source) >= 8
+        and compact_source in compact_target
+    )
+    matched_terms = [term for term in source_terms if term in target_terms]
+    recall = len(matched_terms) / len(source_terms) if source_terms else 0.0
+
+    if len(source_terms) >= 3:
+        required_matches = max(2, math.ceil(len(source_terms) * float(min_key_term_recall)))
+        term_match = len(matched_terms) >= required_matches
+    elif len(source_terms) == 2:
+        term_match = len(matched_terms) == 2
+    elif len(source_terms) == 1:
+        only_term = source_terms[0]
+        term_match = len(only_term) >= 6 and only_term in target_terms
+    else:
+        term_match = False
+
+    return {
+        "reappeared": bool(exact_phrase_match or term_match),
+        "key_term_recall": float(recall),
+        "exact_phrase_match": bool(exact_phrase_match),
+        "key_term_count": len(source_terms),
+        "matched_key_term_count": len(matched_terms),
+    }
 
 
 def _overlapping_tokens(
@@ -849,7 +1040,14 @@ def build_token_advantages(
     ]
     delta_abs_mean = sum(abs(value) for value in advantage_deltas) / len(advantage_deltas)
     baseline_l1 = sum(abs(value) for value in baseline_advantages)
-    delta_l1_ratio = sum(abs(value) for value in advantage_deltas) / max(baseline_l1, eps)
+    transported_l1 = sum(abs(value) for value in token_advantages)
+    delta_l1 = sum(abs(value) for value in advantage_deltas)
+    # Symmetric relative L1 change. Unlike delta / ||baseline||_1, this stays
+    # well-defined when criterion advantages cancel and the scalar baseline is
+    # near zero. The value is bounded in [0, 2].
+    symmetric_l1_scale = 0.5 * (baseline_l1 + transported_l1)
+    delta_l1_ratio = delta_l1 / max(symmetric_l1_scale, eps)
+    delta_l1_ratio = max(0.0, min(2.0, delta_l1_ratio))
     dot = sum(value * baseline for value, baseline in zip(token_advantages, baseline_advantages))
     value_norm = math.sqrt(sum(value * value for value in token_advantages))
     baseline_norm = math.sqrt(sum(value * value for value in baseline_advantages))

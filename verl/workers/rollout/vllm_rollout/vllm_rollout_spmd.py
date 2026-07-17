@@ -140,6 +140,30 @@ class vLLMRollout(BaseRollout):
             llm_signature = inspect.signature(LLM)
         except (TypeError, ValueError):
             llm_signature = None
+        llm_accepts_extra_kwargs = bool(
+            llm_signature is not None
+            and any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in llm_signature.parameters.values()
+            )
+        )
+        if (
+            config.max_num_seqs > 0
+            and llm_signature is not None
+            and (
+                "max_num_seqs" in llm_signature.parameters
+                or llm_accepts_extra_kwargs
+            )
+        ):
+            vllm_init_kwargs["max_num_seqs"] = config.max_num_seqs
+        if (
+            llm_signature is not None
+            and (
+                "enable_prefix_caching" in llm_signature.parameters
+                or llm_accepts_extra_kwargs
+            )
+        ):
+            vllm_init_kwargs["enable_prefix_caching"] = config.enable_prefix_caching
         if (
             config.mm_processor_cache_gb >= 0
             and llm_signature is not None
@@ -285,7 +309,9 @@ class vLLMRollout(BaseRollout):
                         )
                     sampling_params.append(request_params)
             completions: List[RequestOutput] = self.inference_engine.generate(
-                prompts=vllm_inputs, sampling_params=sampling_params
+                prompts=vllm_inputs,
+                sampling_params=sampling_params,
+                use_tqdm=False,
             )
 
         response_ids = []

@@ -60,6 +60,10 @@ class CustomRewardManager:
         if self.ropd_scorer is not None:
             self.ropd_scorer.set_counterfactual_generator(generator)
 
+    def set_counterfactual_session_factory(self, session_factory):
+        if self.ropd_scorer is not None:
+            self.ropd_scorer.set_counterfactual_session_factory(session_factory)
+
     def __call__(self, data: DataProto) -> torch.Tensor:
         if self.ropd_scorer is not None:
             return self.ropd_scorer(data)

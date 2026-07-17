@@ -378,7 +378,8 @@ class RayPPOTrainer:
         self.ray_worker_group_cls = ray_worker_group_cls
         self.best_val_reward_score = -1.0
         self.val_reward_score = 0.0
-        self._counterfactual_generation_lock = threading.Lock()
+        self._counterfactual_generation_lock = threading.RLock()
+        self._counterfactual_session_active = False
 
         # define KL control
         if self.use_reference_policy:
@@ -660,6 +661,37 @@ class RayPPOTrainer:
         for reward_manager in (self.reward_fn, self.val_reward_fn):
             if reward_manager is not None and hasattr(reward_manager, "set_counterfactual_generator"):
                 reward_manager.set_counterfactual_generator(self._generate_counterfactual_suffixes)
+            if reward_manager is not None and hasattr(
+                reward_manager, "set_counterfactual_session_factory"
+            ):
+                reward_manager.set_counterfactual_session_factory(
+                    self._counterfactual_generation_session
+                )
+
+    @contextmanager
+    def _counterfactual_generation_session(self):
+        """Hold one synchronized vLLM session across producer-side group calls."""
+        with self._counterfactual_generation_lock:
+            if self._counterfactual_session_active:
+                raise RuntimeError("nested counterfactual generation sessions are not supported")
+            try:
+                self.actor_rollout_wg.begin_counterfactual_rollout_session()
+            except Exception:
+                # Best-effort cleanup for ranks that may have entered before a
+                # peer failed during the collective weight synchronization.
+                try:
+                    self.actor_rollout_wg.end_counterfactual_rollout_session()
+                except Exception:
+                    pass
+                raise
+            self._counterfactual_session_active = True
+            try:
+                yield
+            finally:
+                try:
+                    self.actor_rollout_wg.end_counterfactual_rollout_session()
+                finally:
+                    self._counterfactual_session_active = False
 
     def _build_text_only_prompt_proto(
         self,
@@ -721,10 +753,7 @@ class RayPPOTrainer:
         if not requests:
             return []
         max_model_len = int(self.config.data.max_prompt_length + self.config.data.max_response_length)
-        prompt_id_lists = []
-        prefix_texts = []
-        requested_new_tokens = []
-        request_seeds = []
+        prepared_requests = []
         rollout_seed = int(getattr(self.config.worker.rollout, "seed", 0))
         forced_prefix = str(getattr(self.config.worker.rollout, "forced_response_prefix", "") or "")
         forced_prefix_ids = (
@@ -732,7 +761,7 @@ class RayPPOTrainer:
             if forced_prefix
             else []
         )
-        for request in requests:
+        for request_index, request in enumerate(requests):
             raw_prompt_ids = [int(token_id) for token_id in request.get("raw_prompt_ids", [])]
             prefix_response_token_ids = [
                 int(token_id) for token_id in request.get("prefix_response_token_ids", [])
@@ -742,72 +771,106 @@ class RayPPOTrainer:
             prompt_ids = raw_prompt_ids + prefix_response_token_ids
             if len(prompt_ids) >= max_model_len:
                 prompt_ids = prompt_ids[-(max_model_len - 1):]
-            prompt_id_lists.append(prompt_ids)
-            prefix_texts.append(
-                self.tokenizer.decode(
-                    prefix_response_token_ids,
+            available_tokens = max(1, max_model_len - len(prompt_ids))
+            requested_new_tokens = min(
+                available_tokens,
+                max(1, int(request.get("max_new_tokens", self.config.data.max_response_length))),
+            )
+            prepared_requests.append(
+                {
+                    "original_index": request_index,
+                    "prompt_ids": prompt_ids,
+                    "prefix_text": self.tokenizer.decode(
+                        prefix_response_token_ids,
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=False,
+                    ),
+                    "max_new_tokens": requested_new_tokens,
+                    "seed": rollout_seed
+                    + int(request.get("_rcpc_pair_seed_offset", request_index)),
+                }
+            )
+
+        # Length bucketing keeps independently padded chunks compact. The
+        # explicit per-request seeds preserve paired factual/control sampling
+        # regardless of this scheduling order.
+        prepared_requests.sort(
+            key=lambda item: (int(item["max_new_tokens"]), len(item["prompt_ids"]))
+        )
+        configured_chunk_size = int(
+            getattr(self.config.worker.reward, "ropd_rcpc_counterfactual_batch_size", 0)
+        )
+        chunk_size = configured_chunk_size if configured_chunk_size > 0 else len(prepared_requests)
+        chunk_records = [
+            prepared_requests[start : start + chunk_size]
+            for start in range(0, len(prepared_requests), chunk_size)
+        ]
+        prompt_chunks = []
+        pad_sizes = []
+        for records in chunk_records:
+            prompt_proto = self._build_text_only_prompt_proto(
+                [record["prompt_ids"] for record in records],
+                max_new_tokens=max(int(record["max_new_tokens"]) for record in records),
+                request_seeds=[int(record["seed"]) for record in records],
+                request_max_new_tokens=[
+                    int(record["max_new_tokens"]) for record in records
+                ],
+            )
+            prompt_proto_padded, pad_size = pad_dataproto_to_divisor(
+                prompt_proto, self.actor_rollout_wg.world_size
+            )
+            prompt_chunks.append(prompt_proto_padded)
+            pad_sizes.append(pad_size)
+
+        with self._counterfactual_generation_lock:
+            if self._counterfactual_session_active:
+                output_chunks_padded = (
+                    self.actor_rollout_wg.generate_sequences_val_chunks_in_session(
+                        prompt_chunks
+                    )
+                )
+            else:
+                output_chunks_padded = self.actor_rollout_wg.generate_sequences_val_chunks(
+                    prompt_chunks
+                )
+        if len(output_chunks_padded) != len(chunk_records):
+            raise RuntimeError(
+                "counterfactual rollout returned {} chunks for {} requests chunks".format(
+                    len(output_chunks_padded), len(chunk_records)
+                )
+            )
+
+        generated_texts = [None] * len(requests)
+        for records, output_padded, pad_size in zip(
+            chunk_records, output_chunks_padded, pad_sizes
+        ):
+            output = unpad_dataproto(output_padded, pad_size=pad_size)
+            response_ids = output.batch["responses"]
+            if response_ids.shape[0] != len(records):
+                raise RuntimeError(
+                    "counterfactual rollout returned {} answers for chunk size {}".format(
+                        response_ids.shape[0], len(records)
+                    )
+                )
+            response_width = response_ids.shape[-1]
+            response_mask = output.batch["attention_mask"][:, -response_width:]
+            for row_index, record in enumerate(records):
+                valid_length = int(response_mask[row_index].sum().item())
+                suffix_ids = response_ids[row_index][:valid_length]
+                suffix_text = self.tokenizer.decode(
+                    suffix_ids,
                     skip_special_tokens=True,
                     clean_up_tokenization_spaces=False,
                 )
-            )
-            available_tokens = max(1, max_model_len - len(prompt_ids))
-            requested_new_tokens.append(
-                min(
-                    available_tokens,
-                    max(1, int(request.get("max_new_tokens", self.config.data.max_response_length))),
-                )
-            )
-            request_seeds.append(
-                rollout_seed + int(request.get("_rcpc_pair_seed_offset", len(request_seeds)))
-            )
-
-        max_prompt_len = max(len(item) for item in prompt_id_lists)
-        max_new_tokens = min(max(requested_new_tokens), max(1, max_model_len - max_prompt_len))
-        if max_new_tokens <= 0:
-            return [
-                {
-                    "text": prefix_text,
-                    "generated_token_count": 0,
-                    "clipped": False,
-                }
-                for prefix_text in prefix_texts
-            ]
-
-        prompt_proto = self._build_text_only_prompt_proto(
-            prompt_id_lists,
-            max_new_tokens=max_new_tokens,
-            request_seeds=request_seeds,
-            request_max_new_tokens=requested_new_tokens,
-        )
-        with self._counterfactual_generation_lock:
-            prompt_proto_padded, pad_size = pad_dataproto_to_divisor(
-                prompt_proto,
-                self.actor_rollout_wg.world_size,
-            )
-            output_padded = self.actor_rollout_wg.generate_sequences_val(
-                prompt_proto_padded
-            )
-            output = unpad_dataproto(output_padded, pad_size=pad_size)
-
-        response_ids = output.batch["responses"]
-        response_width = response_ids.shape[-1]
-        response_mask = output.batch["attention_mask"][:, -response_width:]
-        generated_texts = []
-        for row_index in range(response_ids.shape[0]):
-            valid_length = int(response_mask[row_index].sum().item())
-            suffix_ids = response_ids[row_index][:valid_length]
-            suffix_text = self.tokenizer.decode(
-                suffix_ids,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )
-            generated_texts.append(
-                {
-                    "text": prefix_texts[row_index] + suffix_text,
+                generated_texts[int(record["original_index"])] = {
+                    "text": str(record["prefix_text"]) + suffix_text,
+                    "suffix_text": suffix_text,
                     "generated_token_count": valid_length,
-                    "clipped": valid_length >= max(1, requested_new_tokens[row_index] - 1),
+                    "clipped": valid_length
+                    >= max(1, int(record["max_new_tokens"]) - 1),
                 }
-            )
+        if any(record is None for record in generated_texts):
+            raise RuntimeError("counterfactual rollout did not restore every request")
         return generated_texts
 
     def _validate(self):
@@ -1300,7 +1363,7 @@ class RayPPOTrainer:
                             metrics.update(ropd_metrics)
 
                         # compute rewards. apply_kl_penalty if available
-                        if not self.config.worker.actor.use_kl_loss:  # not grpo
+                        if not self.config.worker.actor.use_kl_loss and self.use_reference_policy:
                             batch, kl_metrics = apply_kl_penalty(
                                 batch, kl_ctrl=self.kl_ctrl, kl_penalty=self.config.algorithm.kl_penalty
                             )

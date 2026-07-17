@@ -35,6 +35,8 @@ class RewardConfig:
     ropd_teacher_answer_count: int = 1
     ropd_max_concurrency: int = 4
     ropd_request_timeout: float = 120.0
+    # Keep transport retries bounded; RCPC performs schema-aware retry/split.
+    ropd_openai_max_retries: int = 1
     ropd_teacher_temperature: Optional[float] = None
     ropd_rubricator_temperature: Optional[float] = None
     ropd_verifier_temperature: Optional[float] = None
@@ -92,14 +94,16 @@ class RewardConfig:
     ropd_rcpc_intervention_max_blocks_per_group: int = 32
     ropd_rcpc_intervention_mode: str = "mask"
     ropd_rcpc_batch_counterfactual: bool = True
+    # Pipeline group-level GPU generation with the global verifier queue while
+    # keeping one synchronized vLLM session open for the whole training batch.
+    ropd_rcpc_overlap_generation_and_judge: bool = False
     # Number of paired prefix-regeneration samples per arm and selected block.
     # m=2 estimates both the paired effect and its sampling uncertainty.
     ropd_rcpc_counterfactual_samples: int = 2
-    # Prefix-regeneration counterfactuals are generated batch-wide. <=0 means
-    # one request for all counterfactuals, which avoids repeated vLLM
-    # wake/sync/sleep cycles; set a positive value only if the single request is
-    # too large for the runtime.
-    ropd_rcpc_counterfactual_batch_size: int = 0
+    # Independent padding/generation chunk size. All chunks share one vLLM
+    # wake/sync/sleep session, so this controls memory efficiency without
+    # reintroducing one full actor-weight synchronization per chunk.
+    ropd_rcpc_counterfactual_batch_size: int = 128
     # Bound each LLM-as-judge request independently from counterfactual
     # generation batching. Large verifier payloads are more likely to return
     # incomplete structured output.

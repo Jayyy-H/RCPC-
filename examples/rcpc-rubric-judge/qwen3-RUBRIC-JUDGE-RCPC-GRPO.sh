@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-JUDGE_MODEL="${JUDGE_MODEL:-}"
-JUDGE_API_KEY="${JUDGE_API_KEY:-}"
-JUDGE_BASE_URL="${JUDGE_BASE_URL:-}"
+# GPT-5.4 Responses gateway credential copied from the known-good data flywheel.
+# This assignment is intentionally before `set -x`, so its value is not echoed.
+GPT5_4_API_KEY_INLINE="AmfJ2xJ8ToUQ0Lk0tBPMCVgw50bdtwWu_GPT_AK"
+JUDGE_MODEL="${JUDGE_MODEL:-gpt-5.4-2026-03-05}"
+if [[ -n "${GPT5_4_API_KEY_INLINE}" ]]; then
+  JUDGE_API_KEY="${GPT5_4_API_KEY_INLINE}"
+else
+  JUDGE_API_KEY="${JUDGE_API_KEY:-${GPT5_4_API_KEY:-${GPT54_API_KEY:-}}}"
+fi
+JUDGE_BASE_URL="${JUDGE_BASE_URL:-${GPT5_4_BASE_URL:-https://aidp-i18ntt-sg.byteintl.net/api/modelhub/online/responses}}"
 JUDGE_API_STYLE="${JUDGE_API_STYLE:-responses}"
+export JUDGE_MODEL JUDGE_API_KEY JUDGE_BASE_URL JUDGE_API_STYLE
 
 set -x
 
@@ -22,6 +30,7 @@ export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
 export VLLM_ALLREDUCE_USE_SYMM_MEM="${VLLM_ALLREDUCE_USE_SYMM_MEM:-0}"
 export VLLM_USE_NCCL_SYMM_MEM="${VLLM_USE_NCCL_SYMM_MEM:-0}"
 export VERL_DISABLE_FLASH_ATTN_CE="${VERL_DISABLE_FLASH_ATTN_CE:-1}"
+export VERL_TRIM_TEXT_MICROBATCH="${VERL_TRIM_TEXT_MICROBATCH:-1}"
 export ROPD_SYNC_AFTER_BACKWARD="${ROPD_SYNC_AFTER_BACKWARD:-1}"
 export ROPD_SYNC_AFTER_OPTIM="${ROPD_SYNC_AFTER_OPTIM:-1}"
 export ROPD_SYNC_VLLM_PHASES="${ROPD_SYNC_VLLM_PHASES:-1}"
@@ -34,9 +43,12 @@ MODEL_PATH="${MODEL_PATH:-/mnt/bn/chenhaobo-va-data/lrj/checkpoints/rcpc/qwen3-4
 TRAIN_FILE="${TRAIN_FILE:-/mnt/bn/chenhaobo-va-data/lrj/data/RaR-Science-20k-o3-mini/splits/rl_rubrics_train.jsonl}"
 VAL_FILE="${VAL_FILE:-/mnt/bn/chenhaobo-va-data/lrj/data/RaR-Science-20k-o3-mini/splits/val_rubrics.jsonl}"
 PROMPT_KEY="${PROMPT_KEY:-question}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-8192}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
 
 export CUDA_VISIBLE_DEVICES="${TRAIN_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-8}"
+ROLLOUT_TENSOR_PARALLEL_SIZE="${ROLLOUT_TENSOR_PARALLEL_SIZE:-2}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-16}"
 MICRO_BATCH_SIZE_FOR_UPDATE="${MICRO_BATCH_SIZE_FOR_UPDATE:-1}"
@@ -57,24 +69,23 @@ RCPC_DERIVE_CANDIDATES_FROM_BUDGET="${RCPC_DERIVE_CANDIDATES_FROM_BUDGET:-true}"
 RCPC_TRANSPORT_LAMBDA="${RCPC_TRANSPORT_LAMBDA:-1.0}"
 RCPC_INTERVENTION_MAX_GROUPS_PER_BATCH="${RCPC_INTERVENTION_MAX_GROUPS_PER_BATCH:--1}"
 RCPC_BATCH_COUNTERFACTUAL="${RCPC_BATCH_COUNTERFACTUAL:-true}"
+RCPC_OVERLAP_GENERATION_AND_JUDGE="${RCPC_OVERLAP_GENERATION_AND_JUDGE:-true}"
 RCPC_COUNTERFACTUAL_SAMPLES="${RCPC_COUNTERFACTUAL_SAMPLES:-2}"
 RCPC_COUNTERFACTUAL_BATCH_SIZE="${RCPC_COUNTERFACTUAL_BATCH_SIZE:-128}"
-
 RCPC_VERIFIER_BATCH_SIZE="${RCPC_VERIFIER_BATCH_SIZE:-12}"
 RCPC_VERIFIER_MAX_INPUT_TOKENS="${RCPC_VERIFIER_MAX_INPUT_TOKENS:-28000}"
 RCPC_VERIFIER_MIN_OUTPUT_TOKENS="${RCPC_VERIFIER_MIN_OUTPUT_TOKENS:-256}"
 RCPC_VERIFIER_OUTPUT_TOKENS_PER_ANSWER="${RCPC_VERIFIER_OUTPUT_TOKENS_PER_ANSWER:-160}"
-
 RCPC_VERIFIER_MAX_RETRIES="${RCPC_VERIFIER_MAX_RETRIES:-2}"
 RCPC_EFFECT_VARIANCE_PRIOR="${RCPC_EFFECT_VARIANCE_PRIOR:-0.1}"
-
 RCPC_FAIL_ON_INTERVENTION_ERROR="${RCPC_FAIL_ON_INTERVENTION_ERROR:-true}"
 ROPD_MAX_CONCURRENCY="${ROPD_MAX_CONCURRENCY:-16}"
+ROPD_OPENAI_MAX_RETRIES="${ROPD_OPENAI_MAX_RETRIES:-1}"
 ROPD_VERIFIER_MAX_OUTPUT_TOKENS="${ROPD_VERIFIER_MAX_OUTPUT_TOKENS:-2048}"
 ROPD_NUM_EXAMINE="${ROPD_NUM_EXAMINE:-1}"
-ROPD_REQUIRE_STRICT_COT_FORMAT="${ROPD_REQUIRE_STRICT_COT_FORMAT:-false}"
+ROPD_REQUIRE_STRICT_COT_FORMAT="${ROPD_REQUIRE_STRICT_COT_FORMAT:-true}"
 ROPD_ZERO_SCORE_ON_FORMAT_ERROR="${ROPD_ZERO_SCORE_ON_FORMAT_ERROR:-false}"
-ROPD_ZERO_CRITERIA_ON_FORMAT_ERROR="${ROPD_ZERO_CRITERIA_ON_FORMAT_ERROR:-true}"
+ROPD_ZERO_CRITERIA_ON_FORMAT_ERROR="${ROPD_ZERO_CRITERIA_ON_FORMAT_ERROR:-false}"
 ROPD_PRINT_STUDENT_OUTPUTS="${ROPD_PRINT_STUDENT_OUTPUTS:-true}"
 ROPD_PRINT_MAX_STUDENT_OUTPUTS="${ROPD_PRINT_MAX_STUDENT_OUTPUTS:-3}"
 ROPD_PRINT_VERIFIER_OUTPUTS="${ROPD_PRINT_VERIFIER_OUTPUTS:-false}"
@@ -85,13 +96,8 @@ ROPD_RCPC_PRINT_MAX_BLOCKS="${ROPD_RCPC_PRINT_MAX_BLOCKS:-16}"
 
 mkdir -p "${WANDB_DIR}" "${WANDB_CACHE_DIR}" "${WANDB_DATA_DIR}"
 
-if [[ -z "${JUDGE_MODEL}" ]]; then
-    echo "ERROR: JUDGE_MODEL is required. Set it to the verifier/judge model name." >&2
-    exit 1
-fi
-
 if [[ -z "${JUDGE_API_KEY}" ]]; then
-    echo "ERROR: JUDGE_API_KEY is required. Set it to the verifier/judge provider API key." >&2
+    echo "ERROR: GPT-5.4 judge credentials are missing. Fill GPT5_4_API_KEY_INLINE at the top of this script, or export JUDGE_API_KEY/GPT5_4_API_KEY/GPT54_API_KEY." >&2
     exit 1
 fi
 
@@ -143,8 +149,11 @@ python3 -m verl.trainer.main \
     trainer.n_gpus_per_node="${N_GPUS_PER_NODE}" \
     trainer.val_before_train=false \
     data.prompt_key="${PROMPT_KEY}" \
+    data.max_prompt_length="${MAX_PROMPT_LENGTH}" \
+    data.max_response_length="${MAX_RESPONSE_LENGTH}" \
     data.rollout_batch_size="${ROLLOUT_BATCH_SIZE}" \
     data.val_batch_size="${VAL_BATCH_SIZE}" \
+    worker.rollout.tensor_parallel_size="${ROLLOUT_TENSOR_PARALLEL_SIZE}" \
     worker.actor.global_batch_size="${GLOBAL_BATCH_SIZE}" \
     worker.actor.micro_batch_size_per_device_for_update="${MICRO_BATCH_SIZE_FOR_UPDATE}" \
     worker.actor.micro_batch_size_per_device_for_experience="${MICRO_BATCH_SIZE_FOR_EXPERIENCE}" \
@@ -163,8 +172,16 @@ python3 -m verl.trainer.main \
     worker.reward.ropd_rcpc_transport_lambda="${RCPC_TRANSPORT_LAMBDA}" \
     worker.reward.ropd_rcpc_intervention_max_groups_per_batch="${RCPC_INTERVENTION_MAX_GROUPS_PER_BATCH}" \
     worker.reward.ropd_rcpc_batch_counterfactual="${RCPC_BATCH_COUNTERFACTUAL}" \
+    worker.reward.ropd_rcpc_overlap_generation_and_judge="${RCPC_OVERLAP_GENERATION_AND_JUDGE}" \
     worker.reward.ropd_rcpc_counterfactual_samples="${RCPC_COUNTERFACTUAL_SAMPLES}" \
     worker.reward.ropd_rcpc_counterfactual_batch_size="${RCPC_COUNTERFACTUAL_BATCH_SIZE}" \
+    worker.reward.ropd_rcpc_verifier_batch_size="${RCPC_VERIFIER_BATCH_SIZE}" \
+    worker.reward.ropd_rcpc_verifier_max_input_tokens="${RCPC_VERIFIER_MAX_INPUT_TOKENS}" \
+    worker.reward.ropd_rcpc_verifier_min_output_tokens="${RCPC_VERIFIER_MIN_OUTPUT_TOKENS}" \
+    worker.reward.ropd_rcpc_verifier_output_tokens_per_answer="${RCPC_VERIFIER_OUTPUT_TOKENS_PER_ANSWER}" \
+    worker.reward.ropd_rcpc_verifier_max_retries="${RCPC_VERIFIER_MAX_RETRIES}" \
+    worker.reward.ropd_rcpc_effect_variance_prior="${RCPC_EFFECT_VARIANCE_PRIOR}" \
+    worker.reward.ropd_rcpc_fail_on_intervention_error="${RCPC_FAIL_ON_INTERVENTION_ERROR}" \
     worker.reward.num_examine="${ROPD_NUM_EXAMINE}" \
     worker.reward.ropd_require_strict_cot_format="${ROPD_REQUIRE_STRICT_COT_FORMAT}" \
     worker.reward.ropd_zero_score_on_format_error="${ROPD_ZERO_SCORE_ON_FORMAT_ERROR}" \
@@ -173,17 +190,11 @@ python3 -m verl.trainer.main \
     worker.reward.ropd_print_max_student_outputs="${ROPD_PRINT_MAX_STUDENT_OUTPUTS}" \
     worker.reward.ropd_print_verifier_outputs="${ROPD_PRINT_VERIFIER_OUTPUTS}" \
     worker.reward.ropd_max_concurrency="${ROPD_MAX_CONCURRENCY}" \
+    worker.reward.ropd_openai_max_retries="${ROPD_OPENAI_MAX_RETRIES}" \
     worker.reward.ropd_verifier_max_output_tokens="${ROPD_VERIFIER_MAX_OUTPUT_TOKENS}" \
     worker.reward.ropd_rcpc_print_intervention_summary="${ROPD_RCPC_PRINT_INTERVENTION_SUMMARY}" \
     worker.reward.ropd_rcpc_print_interval="${ROPD_RCPC_PRINT_INTERVAL}" \
     worker.reward.ropd_rcpc_print_max_groups="${ROPD_RCPC_PRINT_MAX_GROUPS}" \
     worker.reward.ropd_rcpc_print_max_blocks="${ROPD_RCPC_PRINT_MAX_BLOCKS}" \
-    worker.reward.ropd_rcpc_verifier_batch_size="${RCPC_VERIFIER_BATCH_SIZE}" \
-    worker.reward.ropd_rcpc_verifier_max_retries="${RCPC_VERIFIER_MAX_RETRIES}" \
-    worker.reward.ropd_rcpc_fail_on_intervention_error="${RCPC_FAIL_ON_INTERVENTION_ERROR}" \
-    worker.reward.ropd_rcpc_verifier_max_input_tokens="${RCPC_VERIFIER_MAX_INPUT_TOKENS}" \
-    worker.reward.ropd_rcpc_verifier_min_output_tokens="${RCPC_VERIFIER_MIN_OUTPUT_TOKENS}" \
-    worker.reward.ropd_rcpc_verifier_output_tokens_per_answer="${RCPC_VERIFIER_OUTPUT_TOKENS_PER_ANSWER}" \
-    worker.reward.ropd_rcpc_effect_variance_prior="${RCPC_EFFECT_VARIANCE_PRIOR}" \
     "${EXTRA_ARGS[@]}" \
     "$@"

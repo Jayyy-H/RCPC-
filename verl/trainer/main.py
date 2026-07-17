@@ -56,6 +56,7 @@ def _ray_runtime_env_vars():
         "VLLM_DISABLE_PYNCCL",
         "VLLM_WORKER_MULTIPROC_METHOD",
         "VERL_DISABLE_FLASH_ATTN_CE",
+        "VERL_TRIM_TEXT_MICROBATCH",
         "ROPD_VALIDATE_ACTOR_BATCH",
     )
     return {name: os.environ[name] for name in names if name in os.environ}
@@ -97,11 +98,15 @@ def main_task(config: PPOConfig):
 
     # define worker classes
     ray_worker_group_cls = RayWorkerGroup
+    needs_reference_policy = bool(config.worker.actor.use_kl_loss) or abs(
+        float(config.algorithm.kl_coef)
+    ) > 0.0
     role_worker_mapping = {
         Role.ActorRollout: ray.remote(FSDPWorker),
         Role.Critic: ray.remote(FSDPWorker),
-        Role.RefPolicy: ray.remote(FSDPWorker),
     }
+    if needs_reference_policy:
+        role_worker_mapping[Role.RefPolicy] = ray.remote(FSDPWorker)
 
     global_pool_id = "global_pool"
     resource_pool_spec = {
@@ -110,8 +115,9 @@ def main_task(config: PPOConfig):
     mapping = {
         Role.ActorRollout: global_pool_id,
         Role.Critic: global_pool_id,
-        Role.RefPolicy: global_pool_id,
     }
+    if needs_reference_policy:
+        mapping[Role.RefPolicy] = global_pool_id
 
     reward_fn = CustomRewardManager(
         tokenizer=tokenizer,

@@ -21,6 +21,7 @@ from verl.utils.reward_score.rcpc import (
     build_group_candidates,
     build_token_advantages,
     build_token_offsets,
+    measure_deleted_content_reappearance,
     paired_effect_statistics,
 )
 
@@ -55,6 +56,7 @@ _RCPC_LOG_METRICS = frozenset(
         "rcpc/effect_nonzero_ratio",
         "rcpc/effect_standard_error_mean",
         "rcpc/effect_reliability_mean",
+        "rcpc/deleted_content_reappearance_rate",
         "rcpc/verifier_retry_ratio",
         "rcpc/verifier_leaf_failure_ratio",
     }
@@ -63,6 +65,7 @@ _RCPC_LOG_TIMINGS = frozenset(
     {
         "timing_s/rcpc/counterfactual_generation_wall",
         "timing_s/rcpc/intervention_score_wall",
+        "timing_s/rcpc/pipeline_wall",
     }
 )
 
@@ -121,6 +124,22 @@ def _optional_float(value: Any) -> Optional[float]:
     if isinstance(value, str) and not value.strip():
         return None
     return float(value)
+
+
+def _is_structural_verifier_error(exc: Exception) -> bool:
+    """Return true when retrying the same verifier payload cannot fix it."""
+    if isinstance(exc, json.JSONDecodeError):
+        return True
+    message = str(exc).lower()
+    markers = (
+        "schema_version mismatch",
+        "answer count mismatch",
+        "judgement length mismatch",
+        "answer_index must preserve input order",
+        "judgement values must be booleans",
+        "answers for chunk size",
+    )
+    return any(marker in message for marker in markers)
 
 
 def _extract_json_payload(text: str) -> Dict[str, Any]:
@@ -257,6 +276,7 @@ class RopdOpenAIClient:
         base_url_env: str,
         api_style: str,
         timeout: float,
+        max_retries: int,
         include_images: bool,
         max_image_bytes: int,
     ) -> None:
@@ -281,7 +301,14 @@ class RopdOpenAIClient:
         resolved_base_url = _normalize_openai_base_url(_env_or_value(base_url, base_url_env), self.api_style)
         self.include_images = include_images
         self.max_image_bytes = max_image_bytes
-        client_kwargs = {"api_key": api_key, "timeout": timeout}
+        client_kwargs = {
+            "api_key": api_key,
+            "timeout": timeout,
+            # RCPC owns validation-aware retry and request splitting. Keep SDK
+            # retries bounded so one malformed response cannot multiply tail
+            # latency invisibly below that layer.
+            "max_retries": max(0, int(max_retries)),
+        }
         if resolved_base_url is not None:
             client_kwargs["base_url"] = resolved_base_url
         self.client = OpenAI(**client_kwargs)
@@ -388,6 +415,11 @@ class RopdOpenAIClient:
         return [{"role": "user", "content": content}]
 
     def _build_chat_messages(self, text: str, image_urls: Sequence[str]) -> List[Dict[str, Any]]:
+        if not image_urls:
+            # Match the known-working GPT-5.5 gateway request shape used by
+            # the data-generation pipeline. Some OpenAI-compatible gateways
+            # accept typed multimodal content only when media is present.
+            return [{"role": "user", "content": text}]
         content = [{"type": "text", "text": text}]
         for image_url in image_urls:
             content.append({"type": "image_url", "image_url": {"url": image_url}})
@@ -417,6 +449,7 @@ class RopdIPRRewardScorer:
         self._current_global_step = -1
         self._rcpc_summary_printed_by_step: Dict[int, int] = {}
         self._counterfactual_generator: Optional[Callable[[Sequence[Mapping[str, Any]]], List[Any]]] = None
+        self._counterfactual_session_factory: Optional[Callable[[], Any]] = None
 
         base_model = os.getenv("JUDGE_MODEL") or os.getenv("ROPD_MODEL") or _cfg(
             reward_config, "ropd_model", "judge-model"
@@ -433,6 +466,10 @@ class RopdIPRRewardScorer:
 
         self.teacher_answer_count = max(1, int(_cfg(reward_config, "ropd_teacher_answer_count", 1)))
         self.max_concurrency = max(1, int(_cfg(reward_config, "ropd_max_concurrency", 4)))
+        self._rcpc_verifier_executor = ThreadPoolExecutor(
+            max_workers=self.max_concurrency,
+            thread_name_prefix="rcpc-verifier",
+        )
         self.include_ground_truth = bool(_cfg(reward_config, "ropd_include_ground_truth", True))
         self.filter_teacher_by_answer = bool(_cfg(reward_config, "ropd_filter_teacher_by_answer", True))
         self.print_teacher_outputs = bool(_cfg(reward_config, "ropd_print_teacher_outputs", True))
@@ -485,6 +522,9 @@ class RopdIPRRewardScorer:
             )
         self.rcpc_intervention_mode = str(_cfg(reward_config, "ropd_rcpc_intervention_mode", "mask"))
         self.rcpc_batch_counterfactual = bool(_cfg(reward_config, "ropd_rcpc_batch_counterfactual", True))
+        self.rcpc_overlap_generation_and_judge = bool(
+            _cfg(reward_config, "ropd_rcpc_overlap_generation_and_judge", False)
+        )
         self.rcpc_counterfactual_samples = max(
             1, int(_cfg(reward_config, "ropd_rcpc_counterfactual_samples", 2))
         )
@@ -575,6 +615,7 @@ class RopdIPRRewardScorer:
             base_url_env=str(_cfg(reward_config, "ropd_base_url_env", "JUDGE_BASE_URL")),
             api_style=str(_cfg(reward_config, "ropd_api_style", "responses")),
             timeout=float(_cfg(reward_config, "ropd_request_timeout", 120.0)),
+            max_retries=int(_cfg(reward_config, "ropd_openai_max_retries", 1)),
             include_images=bool(_cfg(reward_config, "ropd_include_images", True)),
             max_image_bytes=int(_cfg(reward_config, "ropd_max_image_bytes", 8388608)),
         )
@@ -584,6 +625,12 @@ class RopdIPRRewardScorer:
         generator: Optional[Callable[[Sequence[Mapping[str, Any]]], List[Any]]],
     ) -> None:
         self._counterfactual_generator = generator
+
+    def set_counterfactual_session_factory(
+        self,
+        session_factory: Optional[Callable[[], Any]],
+    ) -> None:
+        self._counterfactual_session_factory = session_factory
 
     def __call__(self, data: DataProto) -> torch.Tensor:
         call_start = time.perf_counter()
@@ -740,6 +787,10 @@ class RopdIPRRewardScorer:
                 }
             )
             all_items.extend(intervention_items)
+        for global_item_index, item in enumerate(all_items):
+            # Keep counterfactual seeds identical whether generation runs as
+            # one batch or through the generation/judge pipeline.
+            item["_rcpc_seed_parent_index"] = global_item_index
         metrics["timing_s/rcpc/build_intervention_plan_wall"] = time.perf_counter() - section_start
         metrics["rcpc/intervention_plan_count"] = float(len(plans))
         metrics["rcpc/intervention_plan_build_error_count"] = float(len(build_errors))
@@ -768,10 +819,27 @@ class RopdIPRRewardScorer:
             max(requested_new_tokens) if requested_new_tokens else 0.0
         )
         if self.rcpc_counterfactual_batch_size > 0 and requested_samples > 0:
-            metrics["rcpc/counterfactual_generation_chunks"] = float(
-                (requested_samples + self.rcpc_counterfactual_batch_size - 1)
-                // self.rcpc_counterfactual_batch_size
-            )
+            if (
+                self.rcpc_overlap_generation_and_judge
+                and self._counterfactual_session_factory is not None
+                and len(plans) > 1
+            ):
+                chunk_count = sum(
+                    (
+                        len(plan["intervention_items"])
+                        * self.rcpc_counterfactual_samples
+                        * arm_count
+                        + self.rcpc_counterfactual_batch_size
+                        - 1
+                    )
+                    // self.rcpc_counterfactual_batch_size
+                    for plan in plans
+                )
+            else:
+                chunk_count = (
+                    requested_samples + self.rcpc_counterfactual_batch_size - 1
+                ) // self.rcpc_counterfactual_batch_size
+            metrics["rcpc/counterfactual_generation_chunks"] = float(chunk_count)
         else:
             metrics["rcpc/counterfactual_generation_chunks"] = 1.0 if requested_samples else 0.0
 
@@ -782,37 +850,6 @@ class RopdIPRRewardScorer:
             metrics["rcpc/effective_group_ratio"] = 0.0
             if build_errors:
                 self._handle_rcpc_plan_errors(build_errors)
-            return metrics
-
-        try:
-            section_start = time.perf_counter()
-            self._populate_counterfactual_texts(all_items)
-            metrics["timing_s/rcpc/counterfactual_generation_wall"] = time.perf_counter() - section_start
-            semantic_pair_flags = []
-            for item in all_items:
-                factual_validity = list(item.get("factual_semantic_valid") or [])
-                control_validity = list(item.get("control_semantic_valid") or [])
-                semantic_pair_flags.extend(
-                    bool(factual_validity[index]) and bool(control_validity[index])
-                    for index in range(min(len(factual_validity), len(control_validity)))
-                )
-            metrics["rcpc/pair_semantic_valid_ratio"] = (
-                sum(semantic_pair_flags) / len(semantic_pair_flags)
-                if semantic_pair_flags
-                else 0.0
-            )
-        except Exception as exc:
-            error = "{}: {}".format(type(exc).__name__, exc)
-            generation_errors = []
-            for plan in plans:
-                plan["result"]["rcpc_error"] = error
-                generation_errors.append((str(plan["result"].get("uid", "unknown")), error))
-            all_errors = build_errors + generation_errors
-            metrics["rcpc/intervention_plan_success_count"] = 0.0
-            metrics["rcpc/intervention_plan_error_count"] = float(len(all_errors))
-            metrics["rcpc/intervention_plan_success_ratio"] = 0.0
-            metrics["rcpc/effective_group_ratio"] = 0.0
-            self._handle_rcpc_plan_errors(all_errors)
             return metrics
 
         def finish_plan(plan: Mapping[str, Any]) -> Tuple[str, Optional[str]]:
@@ -861,13 +898,102 @@ class RopdIPRRewardScorer:
                 result["rcpc_error"] = error
                 return "error", error
 
-        section_start = time.perf_counter()
-        if self.max_concurrency <= 1 or len(plans) <= 1:
-            outcomes = [finish_plan(plan) for plan in plans]
-        else:
-            with ThreadPoolExecutor(max_workers=min(self.max_concurrency, len(plans))) as executor:
-                outcomes = list(executor.map(finish_plan, plans))
-        metrics["timing_s/rcpc/intervention_score_wall"] = time.perf_counter() - section_start
+        pipeline_enabled = bool(
+            self.rcpc_overlap_generation_and_judge
+            and self._counterfactual_session_factory is not None
+            and len(plans) > 1
+        )
+        try:
+            if pipeline_enabled:
+                pipeline_start = time.perf_counter()
+                generation_elapsed = 0.0
+                score_start: Optional[float] = None
+                plan_executor = ThreadPoolExecutor(
+                    max_workers=min(self.max_concurrency, len(plans)),
+                    thread_name_prefix="rcpc-plan",
+                )
+                futures = []
+                try:
+                    with self._counterfactual_session_factory():
+                        for plan in plans:
+                            generation_start = time.perf_counter()
+                            self._populate_counterfactual_texts(
+                                plan["intervention_items"]
+                            )
+                            generation_elapsed += time.perf_counter() - generation_start
+                            if score_start is None:
+                                score_start = time.perf_counter()
+                            futures.append(plan_executor.submit(finish_plan, plan))
+                    outcomes = [future.result() for future in futures]
+                finally:
+                    plan_executor.shutdown(wait=True)
+                pipeline_end = time.perf_counter()
+                metrics["timing_s/rcpc/counterfactual_generation_wall"] = generation_elapsed
+                metrics["timing_s/rcpc/intervention_score_wall"] = (
+                    pipeline_end - score_start if score_start is not None else 0.0
+                )
+                metrics["timing_s/rcpc/pipeline_wall"] = pipeline_end - pipeline_start
+            else:
+                generation_start = time.perf_counter()
+                self._populate_counterfactual_texts(all_items)
+                metrics["timing_s/rcpc/counterfactual_generation_wall"] = (
+                    time.perf_counter() - generation_start
+                )
+                score_start = time.perf_counter()
+                if self.max_concurrency <= 1 or len(plans) <= 1:
+                    outcomes = [finish_plan(plan) for plan in plans]
+                else:
+                    with ThreadPoolExecutor(
+                        max_workers=min(self.max_concurrency, len(plans)),
+                        thread_name_prefix="rcpc-plan",
+                    ) as executor:
+                        outcomes = list(executor.map(finish_plan, plans))
+                metrics["timing_s/rcpc/intervention_score_wall"] = (
+                    time.perf_counter() - score_start
+                )
+
+            semantic_pair_flags = []
+            deleted_content_reappearance_flags = []
+            for item in all_items:
+                factual_validity = list(item.get("factual_semantic_valid") or [])
+                control_validity = list(item.get("control_semantic_valid") or [])
+                semantic_pair_flags.extend(
+                    bool(factual_validity[index]) and bool(control_validity[index])
+                    for index in range(min(len(factual_validity), len(control_validity)))
+                )
+                reappearance_flags = list(
+                    item.get("control_deleted_content_reappeared") or []
+                )
+                deleted_content_reappearance_flags.extend(
+                    1.0 if bool(reappearance_flags[index]) else 0.0
+                    for index in range(min(len(reappearance_flags), len(control_validity)))
+                    if bool(control_validity[index])
+                )
+            metrics["rcpc/pair_semantic_valid_ratio"] = (
+                sum(semantic_pair_flags) / len(semantic_pair_flags)
+                if semantic_pair_flags
+                else 0.0
+            )
+            metrics["rcpc/deleted_content_reappearance_rate"] = (
+                sum(deleted_content_reappearance_flags)
+                / len(deleted_content_reappearance_flags)
+                if deleted_content_reappearance_flags
+                else 0.0
+            )
+        except Exception as exc:
+            error = "{}: {}".format(type(exc).__name__, exc)
+            generation_errors = []
+            for plan in plans:
+                plan["result"]["rcpc_error"] = error
+                generation_errors.append((str(plan["result"].get("uid", "unknown")), error))
+            all_errors = build_errors + generation_errors
+            metrics["rcpc/intervention_plan_success_count"] = 0.0
+            metrics["rcpc/intervention_plan_error_count"] = float(len(all_errors))
+            metrics["rcpc/intervention_plan_success_ratio"] = 0.0
+            metrics["rcpc/effective_group_ratio"] = 0.0
+            self._handle_rcpc_plan_errors(all_errors)
+            return metrics
+
         success_count = sum(1 for status, _error in outcomes if status == "success")
         scored_empty_count = sum(1 for status, _error in outcomes if status == "empty")
         score_errors = [
@@ -1066,7 +1192,11 @@ class RopdIPRRewardScorer:
                     "ground_truth": str(answers[batch_index]) if batch_index < len(answers) else "",
                     "response_text": response_text,
                     "response_token_ids": valid_response_ids,
-                    "response_token_offsets": build_token_offsets(self.tokenizer, valid_response_ids),
+                    "response_token_offsets": build_token_offsets(
+                        self.tokenizer,
+                        valid_response_ids,
+                        decoded_text=response_text,
+                    ),
                     "response_token_entropies": response_token_entropies,
                     "response_length": response_length,
                     "response_limit": int(response_width),
@@ -1428,14 +1558,22 @@ class RopdIPRRewardScorer:
         *,
         prefix_token_ids: Sequence[int],
         max_new_tokens: int,
+        generated_token_count: Optional[int] = None,
+        clipped: Optional[bool] = None,
     ) -> Dict[str, Any]:
         text = str(text or "")
-        token_count = self._count_text_tokens(text)
-        generated_token_count = max(0, token_count - len(prefix_token_ids))
+        if generated_token_count is None:
+            token_count = self._count_text_tokens(text)
+            generated_token_count = max(0, token_count - len(prefix_token_ids))
+        else:
+            generated_token_count = max(0, int(generated_token_count))
         # vLLM does not currently expose finish_reason through this rollout
         # path. Reaching the request limit is therefore the safest observable
         # clipping signal; the one-token tolerance absorbs boundary retokenizing.
-        clipped = generated_token_count >= max(1, int(max_new_tokens) - 1)
+        if clipped is None:
+            clipped = generated_token_count >= max(1, int(max_new_tokens) - 1)
+        else:
+            clipped = bool(clipped)
         semantic_valid = (
             generated_token_count > 0
             and bool(_SUBSTANTIVE_RE.search(text))
@@ -1456,7 +1594,10 @@ class RopdIPRRewardScorer:
             expanded_items = []
             for parent_index, item in enumerate(intervention_items):
                 for sample_index in range(samples):
-                    pair_seed_offset = parent_index * samples + sample_index
+                    seed_parent_index = int(
+                        item.get("_rcpc_seed_parent_index", parent_index)
+                    )
+                    pair_seed_offset = seed_parent_index * samples + sample_index
                     for arm in ("factual", "control"):
                         expanded_item = dict(item)
                         expanded_item["prefix_response_token_ids"] = list(
@@ -1468,33 +1609,11 @@ class RopdIPRRewardScorer:
                         expanded_item["_rcpc_arm"] = arm
                         expanded_item["_rcpc_pair_seed_offset"] = pair_seed_offset
                         expanded_items.append(expanded_item)
-            batch_size = int(self.rcpc_counterfactual_batch_size)
-            generated_answers = []
             with self._counterfactual_lock:
-                if batch_size <= 0:
-                    generated_answers = self._counterfactual_generator(expanded_items)
-                else:
-                    generated_by_index: Dict[int, Any] = {}
-                    indexed_items = list(enumerate(expanded_items))
-                    indexed_items.sort(
-                        key=lambda pair: int(pair[1].get("max_new_tokens", 0) or 0)
-                    )
-                    for start in range(0, len(indexed_items), batch_size):
-                        chunk_pairs = indexed_items[start : start + batch_size]
-                        chunk = [item for _original_index, item in chunk_pairs]
-                        chunk_answers = self._counterfactual_generator(chunk)
-                        if len(chunk_answers) != len(chunk):
-                            raise RuntimeError(
-                                "counterfactual generator returned {} answers for chunk size {}".format(
-                                    len(chunk_answers), len(chunk)
-                                )
-                            )
-                        for (original_index, _item), answer in zip(chunk_pairs, chunk_answers):
-                            generated_by_index[int(original_index)] = answer
-                    generated_answers = [
-                        generated_by_index[index]
-                        for index in range(len(expanded_items))
-                    ]
+                # The trainer owns length bucketing and submits every chunk to
+                # one worker-level sharding session. Calling it once here is
+                # what prevents a full FSDP-to-vLLM weight sync per chunk.
+                generated_answers = self._counterfactual_generator(expanded_items)
             if len(generated_answers) != len(expanded_items):
                 raise RuntimeError(
                     "counterfactual generator returned {} answers for {} intervention items".format(
@@ -1507,7 +1626,9 @@ class RopdIPRRewardScorer:
             for expanded_item, generated_record in zip(expanded_items, generated_answers):
                 if isinstance(generated_record, Mapping):
                     generated_text = str(generated_record.get("text", ""))
+                    suffix_text = generated_record.get("suffix_text")
                     generated_metadata = {
+                        "suffix_text": None if suffix_text is None else str(suffix_text),
                         "generated_token_count": int(
                             generated_record.get("generated_token_count", 0) or 0
                         ),
@@ -1539,23 +1660,28 @@ class RopdIPRRewardScorer:
                         )
                     item[f"{arm}_texts"] = texts
                     qualities = []
+                    suffix_texts = []
+                    prefix_text = self.tokenizer.decode(
+                        item[f"{arm}_prefix_response_token_ids"],
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=False,
+                    )
                     for _sample_index, text, metadata in indexed_samples:
+                        suffix_text = metadata.get("suffix_text") if metadata else None
+                        if suffix_text is None:
+                            suffix_text = text[len(prefix_text) :] if text.startswith(prefix_text) else text
+                        suffix_texts.append(str(suffix_text))
                         quality = self._counterfactual_sample_quality(
                             text,
                             prefix_token_ids=item[f"{arm}_prefix_response_token_ids"],
                             max_new_tokens=int(item[f"{arm}_max_new_tokens"]),
+                            generated_token_count=(
+                                metadata.get("generated_token_count") if metadata else None
+                            ),
+                            clipped=metadata.get("clipped") if metadata else None,
                         )
-                        if metadata:
-                            generated_token_count = int(metadata["generated_token_count"])
-                            clipped = bool(metadata["clipped"])
-                            quality["generated_token_count"] = generated_token_count
-                            quality["clipped"] = clipped
-                            quality["semantic_valid"] = (
-                                generated_token_count > 0
-                                and bool(_SUBSTANTIVE_RE.search(text))
-                                and not clipped
-                            )
                         qualities.append(quality)
+                    item[f"{arm}_suffix_texts"] = suffix_texts
                     item[f"{arm}_format_valid"] = [
                         bool(quality["format_valid"]) for quality in qualities
                     ]
@@ -1565,6 +1691,25 @@ class RopdIPRRewardScorer:
                     item[f"{arm}_clipped"] = [
                         bool(quality["clipped"]) for quality in qualities
                     ]
+                reappearance_measurements = [
+                    measure_deleted_content_reappearance(
+                        str(item.get("block", {}).get("text", "")),
+                        suffix_text,
+                    )
+                    for suffix_text in item.get("control_suffix_texts", [])
+                ]
+                item["control_deleted_content_reappeared"] = [
+                    bool(measurement["reappeared"])
+                    for measurement in reappearance_measurements
+                ]
+                item["control_deleted_content_reappearance_scores"] = [
+                    float(measurement["key_term_recall"])
+                    for measurement in reappearance_measurements
+                ]
+                item["control_deleted_content_exact_match"] = [
+                    bool(measurement["exact_phrase_match"])
+                    for measurement in reappearance_measurements
+                ]
                 item["texts"] = list(item["control_texts"])
                 item["text"] = item["control_texts"][0] if item["control_texts"] else ""
                 item["factual_sample_count"] = len(item["factual_texts"])
@@ -1738,6 +1883,16 @@ class RopdIPRRewardScorer:
                 "factual_texts": factual_texts,
                 "control_text": control_texts[0] if control_texts else "",
                 "control_texts": control_texts,
+                "control_suffix_texts": list(item.get("control_suffix_texts") or []),
+                "control_deleted_content_reappeared": list(
+                    item.get("control_deleted_content_reappeared") or []
+                ),
+                "control_deleted_content_reappearance_scores": list(
+                    item.get("control_deleted_content_reappearance_scores") or []
+                ),
+                "control_deleted_content_exact_match": list(
+                    item.get("control_deleted_content_exact_match") or []
+                ),
                 "intervened_text": control_texts[0] if control_texts else "",
                 "intervened_texts": control_texts,
                 "factual_sample_count": len(factual_answers),
@@ -1784,9 +1939,9 @@ class RopdIPRRewardScorer:
         """Verify paired arms in token-aware batches with local failure isolation.
 
         Factual/control answers for one intervention sample stay in the same
-        request, reducing call-level judge drift. The outer group executor
-        already provides bounded asynchronous concurrency; this method keeps
-        each group sequential and recursively splits only failing chunks.
+        request, reducing call-level judge drift. Initial chunks from every
+        group share one bounded executor; a failing chunk is recursively split
+        inside its task so recovery cannot exceed the global concurrency cap.
         """
         answers_by_key: Dict[Tuple[int, str, int], Mapping[str, Any]] = {}
         diagnostics = {
@@ -1837,15 +1992,21 @@ class RopdIPRRewardScorer:
         if current:
             packed_units.append(current)
 
-        leaf_errors = []
-
-        def verify_units(candidate_units, chunk_label: str) -> None:
+        def verify_units(candidate_units, chunk_label: str):
+            local_answers: Dict[Tuple[int, str, int], Mapping[str, Any]] = {}
+            local_diagnostics = {
+                "request_count": 0.0,
+                "retry_count": 0.0,
+                "split_count": 0.0,
+                "leaf_failure_count": 0.0,
+            }
+            local_errors = []
             items = flattened(candidate_units)
             last_error: Optional[Exception] = None
             for attempt in range(self.rcpc_verifier_max_retries + 1):
-                diagnostics["request_count"] += 1.0
+                local_diagnostics["request_count"] += 1.0
                 if attempt > 0:
-                    diagnostics["retry_count"] += 1.0
+                    local_diagnostics["retry_count"] += 1.0
                 try:
                     payload = self._verify_answers(
                         dict(first),
@@ -1863,20 +2024,35 @@ class RopdIPRRewardScorer:
                             )
                         )
                     for item, answer in zip(items, answers):
-                        answers_by_key[(int(item[0]), str(item[1]), int(item[2]))] = answer
-                    return
+                        local_answers[(int(item[0]), str(item[1]), int(item[2]))] = answer
+                    return local_answers, local_diagnostics, local_errors
                 except Exception as exc:
                     last_error = exc
+                    # A valid HTTP response with the wrong JSON shape will not
+                    # improve by replaying the identical large request. Split
+                    # immediately; reserve retries for transient transport or
+                    # service failures.
+                    if _is_structural_verifier_error(exc):
+                        break
 
             if len(candidate_units) > 1:
-                diagnostics["split_count"] += 1.0
+                local_diagnostics["split_count"] += 1.0
                 midpoint = max(1, len(candidate_units) // 2)
-                verify_units(candidate_units[:midpoint], chunk_label + "L")
-                verify_units(candidate_units[midpoint:], chunk_label + "R")
-                return
+                for child_units, child_label in (
+                    (candidate_units[:midpoint], chunk_label + "L"),
+                    (candidate_units[midpoint:], chunk_label + "R"),
+                ):
+                    child_answers, child_diagnostics, child_errors = verify_units(
+                        child_units, child_label
+                    )
+                    local_answers.update(child_answers)
+                    for key, value in child_diagnostics.items():
+                        local_diagnostics[key] += float(value)
+                    local_errors.extend(child_errors)
+                return local_answers, local_diagnostics, local_errors
 
-            diagnostics["leaf_failure_count"] += 1.0
-            leaf_errors.append(
+            local_diagnostics["leaf_failure_count"] += 1.0
+            local_errors.append(
                 "unit={} answers={} error={}: {}".format(
                     chunk_label,
                     len(items),
@@ -1884,9 +2060,23 @@ class RopdIPRRewardScorer:
                     last_error,
                 )
             )
+            return local_answers, local_diagnostics, local_errors
 
-        for chunk_index, candidate_units in enumerate(packed_units):
-            verify_units(candidate_units, str(chunk_index))
+        # All groups share this executor, so one slow group cannot monopolize a
+        # dedicated thread while other ready verifier chunks wait behind it.
+        futures = [
+            self._rcpc_verifier_executor.submit(
+                verify_units, candidate_units, str(chunk_index)
+            )
+            for chunk_index, candidate_units in enumerate(packed_units)
+        ]
+        leaf_errors = []
+        for future in futures:
+            local_answers, local_diagnostics, local_errors = future.result()
+            answers_by_key.update(local_answers)
+            for key, value in local_diagnostics.items():
+                diagnostics[key] += float(value)
+            leaf_errors.extend(local_errors)
 
         if leaf_errors:
             with self._print_lock:
@@ -2134,12 +2324,27 @@ class RopdIPRRewardScorer:
         answers: Sequence[str],
     ) -> str:
         ground_truth = info["ground_truth"] if self.include_ground_truth else "N/A"
+        verifier_rubrics = [
+            {
+                "criterion_id": str(item["criterion_id"]),
+                "criterion": str(
+                    item.get("criterion")
+                    or item.get("description")
+                    or item.get("title")
+                    or ""
+                ),
+                "points": float(item["points"]),
+            }
+            for item in rubric["rubrics"]
+        ]
         return _render_template(
             self.verifier_template,
             {
                 "question": info["raw_prompt"],
                 "ground_truth": ground_truth,
-                "rubrics": json.dumps(rubric["rubrics"], ensure_ascii=False, indent=2),
+                "rubrics": json.dumps(
+                    verifier_rubrics, ensure_ascii=False, separators=(",", ":")
+                ),
                 "answers": _render_answer_block("Answer", answers),
             },
         )
@@ -2673,6 +2878,15 @@ class RopdIPRRewardScorer:
                         "counterfactual_sample_count": int(payload.get("counterfactual_sample_count", 1)),
                         "factual_format_valid": payload.get("factual_format_valid", []),
                         "control_format_valid": payload.get("control_format_valid", []),
+                        "deleted_content_reappeared": payload.get(
+                            "control_deleted_content_reappeared", []
+                        ),
+                        "deleted_content_reappearance_scores": payload.get(
+                            "control_deleted_content_reappearance_scores", []
+                        ),
+                        "deleted_content_exact_match": payload.get(
+                            "control_deleted_content_exact_match", []
+                        ),
                         "pair_format_valid": payload.get("pair_format_valid", []),
                         "valid_pair_count": int(payload.get("valid_pair_count", 0)),
                         "invalid_pair_count": int(payload.get("invalid_pair_count", 0)),

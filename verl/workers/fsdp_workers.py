@@ -15,7 +15,7 @@
 The main entry point to run the PPO algorithm
 """
 
-from typing import Literal
+from typing import List, Literal, Sequence
 
 import torch
 import torch.distributed as dist
@@ -60,6 +60,67 @@ from verl.workers.sharding_manager import FSDPVLLMShardingManager
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
 
+def _dispatch_dp_compute_proto_chunks(worker_group, prompt_chunks, **kwargs):
+    """Shard every global DataProto chunk across the same DP worker group."""
+    if not isinstance(prompt_chunks, Sequence):
+        raise TypeError("prompt_chunks must be a sequence of DataProto objects")
+
+    chunks_per_worker: List[List[DataProto]] = [
+        [] for _ in range(worker_group.world_size)
+    ]
+    for chunk_index, prompt_chunk in enumerate(prompt_chunks):
+        if not isinstance(prompt_chunk, DataProto):
+            raise TypeError(
+                "prompt_chunks[{}] must be DataProto, got {}".format(
+                    chunk_index, type(prompt_chunk).__name__
+                )
+            )
+        worker_shards = prompt_chunk.chunk(chunks=worker_group.world_size)
+        for worker_index, shard in enumerate(worker_shards):
+            chunks_per_worker[worker_index].append(shard)
+
+    dispatched_kwargs = {
+        key: [value] * worker_group.world_size for key, value in kwargs.items()
+    }
+    return [chunks_per_worker], dispatched_kwargs
+
+
+def _collect_dp_compute_proto_chunks(worker_group, worker_outputs):
+    """Restore the global batch for each chunk without merging chunk padding."""
+    if len(worker_outputs) != worker_group.world_size:
+        raise RuntimeError(
+            "expected {} worker outputs, got {}".format(
+                worker_group.world_size, len(worker_outputs)
+            )
+        )
+    if not worker_outputs:
+        return []
+
+    chunk_count = len(worker_outputs[0])
+    for worker_index, outputs in enumerate(worker_outputs):
+        if len(outputs) != chunk_count:
+            raise RuntimeError(
+                "worker {} returned {} chunks, expected {}".format(
+                    worker_index, len(outputs), chunk_count
+                )
+            )
+        if any(not isinstance(output, DataProto) for output in outputs):
+            raise TypeError("counterfactual chunk workers must return DataProto objects")
+
+    return [
+        DataProto.concat(
+            [worker_outputs[worker_index][chunk_index] for worker_index in range(worker_group.world_size)]
+        )
+        for chunk_index in range(chunk_count)
+    ]
+
+
+_DP_COMPUTE_PROTO_CHUNKS = {
+    "dispatch_fn": _dispatch_dp_compute_proto_chunks,
+    "collect_fn": _collect_dp_compute_proto_chunks,
+}
+
+
 def print_trainable_params(model):
     import re
     from prettytable import PrettyTable
@@ -100,6 +161,7 @@ class FSDPWorker(Worker):
     ):
         super().__init__()
         self.config = config
+        self._counterfactual_rollout_session_active = False
 
         if not dist.is_initialized():
             dist.init_process_group(backend="nccl")
@@ -315,6 +377,7 @@ class FSDPWorker(Worker):
                 module=self.fsdp_module,
                 inference_engine=self.rollout.inference_engine,
                 device_mesh=rollout_device_mesh,
+                enable_prefix_caching=self.config.rollout.enable_prefix_caching,
             )
             log_gpu_memory_usage("After building sharding manager")
         else:
@@ -518,6 +581,115 @@ class FSDPWorker(Worker):
         torch.cuda.empty_cache()  # clear kv cache
         log_gpu_memory_usage("After recompute log prob")
         return output
+
+    @register(dispatch_mode=_DP_COMPUTE_PROTO_CHUNKS)
+    def generate_sequences_val_chunks(self, prompt_chunks: Sequence[DataProto], **kwargs):
+        """Generate many independently padded chunks with one FSDP-to-vLLM sync."""
+        assert self._is_rollout
+        if not prompt_chunks:
+            return []
+
+        if self._use_param_offload:
+            load_fsdp_model(self.fsdp_module)
+
+        meta_info = {
+            "eos_token_id": self.generation_config.eos_token_id
+            if self.generation_config is not None
+            else self.tokenizer.eos_token_id,
+            "pad_token_id": self.generation_config.pad_token_id
+            if self.generation_config is not None
+            else self.tokenizer.pad_token_id,
+        }
+        for prompts in prompt_chunks:
+            prompts.meta_info.update(meta_info)
+
+        outputs = []
+        with self.rollout_sharding_manager:
+            # Synchronize actor weights once, then keep vLLM awake while every
+            # counterfactual chunk is generated.
+            if self._use_param_offload:
+                offload_fsdp_model(self.fsdp_module)
+            if self._use_optimizer_offload:
+                offload_fsdp_optimizer(optimizer=self.optimizer)
+
+            log_gpu_memory_usage("After entering batched rollout sharding manager")
+            for prompts in prompt_chunks:
+                local_prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+                output = self.rollout.generate_sequences_val(
+                    prompts=local_prompts, **kwargs
+                )
+                output = self.rollout_sharding_manager.postprocess_data(output)
+                outputs.append(output.to("cpu"))
+
+        torch.cuda.empty_cache()
+        log_gpu_memory_usage("After batched counterfactual rollout")
+        return outputs
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def begin_counterfactual_rollout_session(self):
+        """Wake and synchronize vLLM once for a driver-side producer loop."""
+        assert self._is_rollout
+        if self._counterfactual_rollout_session_active:
+            raise RuntimeError("counterfactual rollout session is already active")
+        if self._use_param_offload:
+            load_fsdp_model(self.fsdp_module)
+
+        entered = False
+        try:
+            self.rollout_sharding_manager.__enter__()
+            entered = True
+            if self._use_param_offload:
+                offload_fsdp_model(self.fsdp_module)
+            if self._use_optimizer_offload:
+                offload_fsdp_optimizer(optimizer=self.optimizer)
+            self._counterfactual_rollout_session_active = True
+            log_gpu_memory_usage("After beginning counterfactual rollout session")
+            return True
+        except Exception:
+            if entered:
+                self.rollout_sharding_manager.__exit__(None, None, None)
+            raise
+
+    @register(dispatch_mode=_DP_COMPUTE_PROTO_CHUNKS)
+    def generate_sequences_val_chunks_in_session(
+        self, prompt_chunks: Sequence[DataProto], **kwargs
+    ):
+        """Generate chunks while an explicit counterfactual session is active."""
+        assert self._is_rollout
+        if not self._counterfactual_rollout_session_active:
+            raise RuntimeError("counterfactual rollout session is not active")
+
+        meta_info = {
+            "eos_token_id": self.generation_config.eos_token_id
+            if self.generation_config is not None
+            else self.tokenizer.eos_token_id,
+            "pad_token_id": self.generation_config.pad_token_id
+            if self.generation_config is not None
+            else self.tokenizer.pad_token_id,
+        }
+        outputs = []
+        for prompts in prompt_chunks:
+            prompts.meta_info.update(meta_info)
+            local_prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+            output = self.rollout.generate_sequences_val(
+                prompts=local_prompts, **kwargs
+            )
+            output = self.rollout_sharding_manager.postprocess_data(output)
+            outputs.append(output.to("cpu"))
+        return outputs
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def end_counterfactual_rollout_session(self):
+        """Close a producer session and restore actor/vLLM memory state."""
+        if not self._counterfactual_rollout_session_active:
+            return False
+        try:
+            self.rollout_sharding_manager.__exit__(None, None, None)
+        finally:
+            self._counterfactual_rollout_session_active = False
+            torch.cuda.empty_cache()
+        log_gpu_memory_usage("After ending counterfactual rollout session")
+        return True
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):

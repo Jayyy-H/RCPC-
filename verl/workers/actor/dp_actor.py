@@ -226,6 +226,28 @@ class DataParallelPPOActor(BasePPOActor):
         position_ids = micro_batch["position_ids"]
         responses = micro_batch["responses"]
         response_length = responses.size(-1)
+        output_response_length = response_length
+        trim_text_microbatch = (
+            self._env_flag("VERL_TRIM_TEXT_MICROBATCH", "0")
+            and input_ids.size(0) == 1
+            and position_ids.dim() == 2
+            and "pixel_values" not in micro_batch
+            and "images" not in micro_batch
+        )
+        if trim_text_microbatch:
+            prompt_width = input_ids.size(-1) - response_length
+            prompt_mask = attention_mask[:, :prompt_width]
+            response_mask = attention_mask[:, -response_length:]
+            valid_prompt_length = int(prompt_mask.sum().item())
+            valid_response_length = int(response_mask.sum().item())
+            if valid_prompt_length > 0 and valid_response_length > 0:
+                sequence_start = prompt_width - valid_prompt_length
+                sequence_end = prompt_width + valid_response_length
+                input_ids = input_ids[:, sequence_start:sequence_end]
+                attention_mask = attention_mask[:, sequence_start:sequence_end]
+                position_ids = position_ids[:, sequence_start:sequence_end]
+                responses = responses[:, :valid_response_length]
+                response_length = valid_response_length
         # is_onpolicy = micro_batch["is_onpolicy"] # (bs, 1)
         if position_ids.dim() == 3:  # qwen2vl mrope
             position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
@@ -261,6 +283,11 @@ class DataParallelPPOActor(BasePPOActor):
             logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
             log_probs = logprobs_from_logits(logits, responses)  # (bsz, response_length)
             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+
+        if response_length < output_response_length:
+            pad_width = output_response_length - response_length
+            log_probs = torch.nn.functional.pad(log_probs, (0, pad_width))
+            entropy = torch.nn.functional.pad(entropy, (0, pad_width))
 
         return entropy, log_probs
 
