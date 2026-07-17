@@ -74,6 +74,108 @@ _FORMULA_FRAGMENT_RE = re.compile(
     r"[a-z0-9.]+(?:\s*[=+*/^<>≈≠≤≥∝]\s*[a-z0-9.]+)+",
     re.IGNORECASE,
 )
+_PROTECTED_SPAN_PATTERNS = (
+    re.compile(r"```.*?```", re.DOTALL),
+    re.compile(r"(?<!`)`[^`\n]+`(?!`)"),
+    re.compile(r"\$\$.*?\$\$", re.DOTALL),
+    re.compile(
+        r"(?<!\\)\$(?![\s$])(?:\\.|[^$\\])+?(?<!\\)\$(?![\w$])",
+        re.DOTALL,
+    ),
+    re.compile(r"\\\(.*?\\\)", re.DOTALL),
+    re.compile(r"\\\[.*?\\\]", re.DOTALL),
+    re.compile(
+        r"\\begin\{(?P<environment>[^{}]+)\}.*?\\end\{(?P=environment)\}",
+        re.DOTALL,
+    ),
+)
+_SEMANTIC_BOUNDARY_PATTERNS = (
+    (3, r"[\n;；]"),
+    (3, r"(?<!\d\.)(?<=[.!?。！？])\s+"),
+    (3, r"(?m)(?=^\s*(?:Step\s*)?\d+[.)]\s+)"),
+    (2, r"(?=</?(?:reasoning|think|answer)\b)"),
+    (1, r"(?:(?<!\d)[,，]|[,，](?!\d))"),
+)
+_DISCOURSE_MARKER_RE = re.compile(
+    r"\b(?:therefore|however|so|if|then|because|but|thus|hence|next|now|wait|check|conclude|finally|let's|let us|using|substituting)\b",
+    re.IGNORECASE,
+)
+_SOFT_CAP_ONLY_BOUNDARY_PATTERNS = (
+    (2, r"(?:(?<!\d)[:：]|[:：](?!\d))"),
+)
+
+
+def _merge_character_ranges(ranges: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    merged: List[List[int]] = []
+    for start, end in sorted(ranges):
+        if end <= start:
+            continue
+        if not merged or start > merged[-1][1]:
+            merged.append([int(start), int(end)])
+        else:
+            merged[-1][1] = max(merged[-1][1], int(end))
+    return [(start, end) for start, end in merged]
+
+
+def _protected_character_ranges(text: str) -> List[Tuple[int, int]]:
+    """Return regions whose internal punctuation is not an action boundary."""
+    ranges: List[Tuple[int, int]] = []
+    for pattern in _PROTECTED_SPAN_PATTERNS:
+        ranges.extend((match.start(), match.end()) for match in pattern.finditer(text))
+
+    # Parenthesized expressions often contain formula arguments or local
+    # qualifications. Keep their punctuation internal while still allowing a
+    # boundary immediately after the closing delimiter.
+    matching_open = {")": "(", "]": "[", "}": "{"}
+    stack: List[Tuple[str, int]] = []
+    for index, char in enumerate(text):
+        if index > 0 and text[index - 1] == "\\":
+            continue
+        if char in "([{":
+            stack.append((char, index))
+        elif char in matching_open and stack and stack[-1][0] == matching_open[char]:
+            _opening, start = stack.pop()
+            ranges.append((start, index + 1))
+    return _merge_character_ranges(ranges)
+
+
+def _position_is_protected(position: int, ranges: Sequence[Tuple[int, int]]) -> bool:
+    return any(start <= position < end for start, end in ranges)
+
+
+def _semantic_boundaries(
+    text: str,
+    *,
+    include_soft_cap_only: bool = False,
+) -> List[Tuple[int, int]]:
+    """Collect legal ``(character boundary, priority)`` pairs."""
+    protected_ranges = _protected_character_ranges(text)
+    priorities: Dict[int, int] = {}
+    patterns = list(_SEMANTIC_BOUNDARY_PATTERNS)
+    if include_soft_cap_only:
+        patterns.extend(_SOFT_CAP_ONLY_BOUNDARY_PATTERNS)
+    for priority, pattern in patterns:
+        for match in re.finditer(pattern, text):
+            if _position_is_protected(match.start(), protected_ranges):
+                continue
+            boundary = match.end() if match.end() > match.start() else match.start()
+            if 0 < boundary < len(text):
+                priorities[boundary] = max(priorities.get(boundary, 0), int(priority))
+
+    # A discourse word is a boundary only at an actual clause edge. Matching
+    # every occurrence would fragment phrases such as "the next conclusion"
+    # or "is therefore equal". Punctuation/newline remains part of the prior
+    # action while the marker stays attached to the following clause.
+    for match in _DISCOURSE_MARKER_RE.finditer(text):
+        position = match.start()
+        if _position_is_protected(position, protected_ranges):
+            continue
+        prefix = text[:position].rstrip(" \t")
+        if not prefix or prefix[-1] not in ",，;；.!?。！？:：\n":
+            continue
+        if 0 < position < len(text):
+            priorities[position] = max(priorities.get(position, 0), 1)
+    return sorted(priorities.items())
 
 
 def build_token_offsets(
@@ -189,23 +291,9 @@ def split_micro_actions(text: str, min_chars: int, max_chars: int) -> List[Tuple
         base_offset = 0
 
     spans: List[Tuple[int, int, str]] = []
-    boundaries = set()
     start = 0
-    boundary_patterns = [
-        r"(?<!\d)[,，](?!\d)",
-        r"[\n;；]",
-        r"(?<!\d\.)(?<=[.!?。！？])\s+",
-        r"(?=</?(?:reasoning|think|answer)\b)",
-        r"(?m)(?=^\s*(?:Step\s*)?\d+[.)]\s+)",
-        r"(?i)(?=\b(?:therefore|however|so|if|then|because|but|thus|hence|next|now|wait|check|conclude|finally|let's|let us|using|substituting)\b)",
-    ]
-    for pattern in boundary_patterns:
-        for match in re.finditer(pattern, working_text):
-            boundary = match.end() if match.end() > match.start() else match.start()
-            if 0 < boundary < len(working_text):
-                boundaries.add(boundary)
-
-    for boundary in sorted(boundaries | {len(working_text)}):
+    boundaries = [boundary for boundary, _priority in _semantic_boundaries(working_text)]
+    for boundary in sorted(set(boundaries) | {len(working_text)}):
         chunk_start, chunk_end = start, boundary
         if chunk_end <= chunk_start:
             continue
@@ -411,23 +499,77 @@ def _cap_spans_by_token_count(
     offsets: Sequence[Tuple[int, int]],
     max_action_tokens: int,
 ) -> List[Tuple[int, int, str]]:
+    """Apply a semantic soft cap without cutting an indivisible action.
+
+    ``max_action_tokens`` is a target, not a hard slicing interval. We first
+    use the last legal boundary before the target; if none exists, we allow the
+    next legal boundary up to twice the target. A span with no such boundary is
+    preserved intact so formulas and single inference clauses cannot be split
+    at arbitrary token positions.
+    """
     if max_action_tokens <= 0:
         return list(spans)
+
+    def token_count(start: int, end: int) -> int:
+        return len(_overlapping_tokens(offsets, start, end))
+
+    def append_piece(output: List[Tuple[int, int, str]], start: int, end: int) -> None:
+        piece_start, piece_end, piece = _trim_edge_structural_tags(
+            response_text[start:end], start
+        )
+        if piece:
+            display = piece.rstrip(",，;；").strip() or piece
+            output.append((piece_start, piece_end, display))
+
     capped: List[Tuple[int, int, str]] = []
     for char_start, char_end, action_text in spans:
         token_indices = _overlapping_tokens(offsets, char_start, char_end)
         if len(token_indices) <= max_action_tokens:
             capped.append((char_start, char_end, action_text))
             continue
-        for offset in range(0, len(token_indices), max_action_tokens):
-            chunk = token_indices[offset : offset + max_action_tokens]
-            if not chunk:
-                continue
-            s = max(char_start, offsets[chunk[0]][0])
-            e = min(char_end, offsets[chunk[-1]][1])
-            piece = response_text[s:e].strip()
-            if piece:
-                capped.append((s, e, piece.rstrip(",，;；").strip() or piece))
+
+        local_text = response_text[char_start:char_end]
+        legal_boundaries = [
+            char_start + boundary
+            for boundary, _priority in _semantic_boundaries(
+                local_text, include_soft_cap_only=True
+            )
+        ]
+        cursor = char_start
+        while token_count(cursor, char_end) > max_action_tokens:
+            candidates = [
+                boundary
+                for boundary in legal_boundaries
+                if cursor < boundary < char_end
+            ]
+            before_target = [
+                boundary
+                for boundary in candidates
+                if 0 < token_count(cursor, boundary) <= max_action_tokens
+                and token_count(boundary, char_end) > 0
+            ]
+            if before_target:
+                cut = max(before_target)
+            else:
+                after_target = [
+                    boundary
+                    for boundary in candidates
+                    if max_action_tokens
+                    < token_count(cursor, boundary)
+                    <= 2 * max_action_tokens
+                    and token_count(boundary, char_end) > 0
+                ]
+                cut = min(after_target) if after_target else None
+
+            if cut is None:
+                append_piece(capped, cursor, char_end)
+                cursor = char_end
+                break
+            append_piece(capped, cursor, cut)
+            cursor = cut
+
+        if cursor < char_end:
+            append_piece(capped, cursor, char_end)
     return capped
 
 
