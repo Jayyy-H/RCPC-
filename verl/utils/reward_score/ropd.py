@@ -4,6 +4,7 @@ import json
 import mimetypes
 import os
 import re
+import statistics
 import threading
 import time
 from collections import OrderedDict, defaultdict
@@ -21,8 +22,10 @@ from verl.utils.reward_score.rcpc import (
     build_group_candidates,
     build_token_advantages,
     build_token_offsets,
+    compute_dynamic_group_budget,
     measure_deleted_content_reappearance,
     paired_effect_statistics,
+    score_actions,
 )
 
 
@@ -487,17 +490,41 @@ class RopdIPRRewardScorer:
         )
         self.rcpc_enabled = bool(_cfg(reward_config, "ropd_rcpc_enabled", False))
         self.rcpc_use_token_advantage = bool(_cfg(reward_config, "ropd_rcpc_use_token_advantage", True))
-        self.rcpc_budget = max(1, int(_cfg(reward_config, "ropd_rcpc_budget", 32)))
+        self.rcpc_budget = max(1, int(_cfg(reward_config, "ropd_rcpc_budget", 24)))
         self.rcpc_derive_candidates_from_budget = bool(
             _cfg(reward_config, "ropd_rcpc_derive_candidates_from_budget", True)
         )
+        self.rcpc_dynamic_budget_enabled = bool(
+            _cfg(reward_config, "ropd_rcpc_dynamic_budget_enabled", True)
+        )
+        self.rcpc_min_budget = max(1, int(_cfg(reward_config, "ropd_rcpc_min_budget", 12)))
+        self.rcpc_max_budget = max(1, int(_cfg(reward_config, "ropd_rcpc_max_budget", 28)))
+        self.rcpc_candidate_pool_multiplier = max(
+            1, int(_cfg(reward_config, "ropd_rcpc_candidate_pool_multiplier", 2))
+        )
+        configured_reference = float(
+            _cfg(reward_config, "ropd_rcpc_reference_action_count", 0.0)
+        )
+        self._rcpc_reference_action_count_from_config = configured_reference > 0.0
+        self._rcpc_reference_action_count: Optional[float] = (
+            configured_reference if configured_reference > 0.0 else None
+        )
+        self._rcpc_budget_lock = threading.Lock()
+        if self.rcpc_dynamic_budget_enabled and self.rcpc_derive_candidates_from_budget:
+            if self.rcpc_min_budget > self.rcpc_max_budget:
+                raise ValueError("ropd_rcpc_min_budget must be <= ropd_rcpc_max_budget")
+            if not self.rcpc_min_budget <= self.rcpc_budget <= self.rcpc_max_budget:
+                raise ValueError(
+                    "ropd_rcpc_budget must lie within [ropd_rcpc_min_budget, "
+                    "ropd_rcpc_max_budget] when dynamic budgeting is enabled"
+                )
         if self.rcpc_derive_candidates_from_budget:
-            # The method-level budget is B_group: the number of local causal
-            # interventions allowed for one prompt group. Candidate discovery
-            # is derived from the same knob so experiments do not silently use
-            # inconsistent action/block/intervention budgets.
-            self.rcpc_top_blocks = self.rcpc_budget
-            self.rcpc_top_actions = max(2, self.rcpc_budget * 2)
+            # Keep a wider local candidate pool than the actual intervention
+            # budget. Entropy discovers candidates; entropy x criterion-
+            # advantage priority then chooses which B_group blocks to execute.
+            candidate_pool_size = self.rcpc_budget * self.rcpc_candidate_pool_multiplier
+            self.rcpc_top_blocks = max(1, candidate_pool_size)
+            self.rcpc_top_actions = max(2, candidate_pool_size)
         else:
             self.rcpc_top_actions = max(1, int(_cfg(reward_config, "ropd_rcpc_top_actions", 12)))
             self.rcpc_top_blocks = max(1, int(_cfg(reward_config, "ropd_rcpc_top_blocks", 6)))
@@ -632,6 +659,123 @@ class RopdIPRRewardScorer:
     ) -> None:
         self._counterfactual_session_factory = session_factory
 
+    def state_dict(self) -> Dict[str, Any]:
+        """Return the small amount of scorer state needed for exact resume."""
+        return {
+            "version": 1,
+            "rcpc_reference_action_count": self._rcpc_reference_action_count,
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Restore an auto-calibrated action reference from a checkpoint."""
+        if self._rcpc_reference_action_count_from_config:
+            return
+        value = state.get("rcpc_reference_action_count")
+        if value is None:
+            return
+        value = float(value)
+        if value <= 0.0:
+            raise ValueError("checkpoint rcpc_reference_action_count must be positive")
+        with self._rcpc_budget_lock:
+            self._rcpc_reference_action_count = value
+
+    def _analyze_dynamic_rcpc_group(
+        self,
+        group: Sequence[Mapping[str, Any]],
+    ) -> Tuple[List[List[Dict[str, Any]]], int]:
+        precomputed_actions: List[List[Dict[str, Any]]] = []
+        group_action_count = 0
+        for info in group:
+            if bool(info.get("response_clipped", False)) or not _SUBSTANTIVE_RE.search(
+                str(info.get("response_text", ""))
+            ):
+                actions = []
+            else:
+                token_entropies = list(info.get("response_token_entropies") or [])
+                response_length = int(info.get("response_length", 0))
+                if len(token_entropies) < response_length:
+                    token_entropies.extend([0.0] * (response_length - len(token_entropies)))
+                actions = score_actions(
+                    str(info.get("response_text", "")),
+                    info.get("response_token_offsets") or [],
+                    token_entropies,
+                    min_action_chars=self.rcpc_min_action_chars,
+                    max_action_chars=self.rcpc_max_action_chars,
+                    max_action_tokens=self.rcpc_max_action_tokens,
+                    min_robust_denom=self.rcpc_min_robust_denom,
+                )
+            precomputed_actions.append(actions)
+            group_action_count += sum(
+                1 for action in actions if int(action.get("token_count", 0)) > 0
+            )
+        return precomputed_actions, group_action_count
+
+    def _prepare_dynamic_rcpc_budgets(
+        self,
+        groups: Sequence[Sequence[Dict[str, Any]]],
+        *,
+        skip_rcpc_credit: bool,
+    ) -> None:
+        """Analyze one batch, freeze A_ref once, and assign each group B_g."""
+        if (
+            skip_rcpc_credit
+            or not self.rcpc_enabled
+            or not self.rcpc_intervention_enabled
+            or not self.rcpc_derive_candidates_from_budget
+            or not self.rcpc_dynamic_budget_enabled
+        ):
+            return
+
+        if self.max_concurrency > 1 and len(groups) > 1:
+            with ThreadPoolExecutor(max_workers=min(self.max_concurrency, len(groups))) as executor:
+                analyses = list(executor.map(self._analyze_dynamic_rcpc_group, groups))
+        else:
+            analyses = [self._analyze_dynamic_rcpc_group(group) for group in groups]
+
+        positive_action_counts = []
+        for group, (precomputed_actions, group_action_count) in zip(groups, analyses):
+            group[0]["_rcpc_precomputed_actions"] = precomputed_actions
+            group[0]["_rcpc_group_action_count"] = group_action_count
+            if group_action_count > 0:
+                positive_action_counts.append(group_action_count)
+
+        if self._rcpc_reference_action_count is None and positive_action_counts:
+            reference = float(statistics.median(positive_action_counts))
+            with self._rcpc_budget_lock:
+                if self._rcpc_reference_action_count is None:
+                    self._rcpc_reference_action_count = reference
+                    with self._print_lock:
+                        print(
+                            "[rcpc dynamic budget reference] "
+                            + json.dumps(
+                                {
+                                    "reference_action_count": reference,
+                                    "source": "first_training_batch_median",
+                                    "base_budget": self.rcpc_budget,
+                                    "min_budget": self.rcpc_min_budget,
+                                    "max_budget": self.rcpc_max_budget,
+                                },
+                                ensure_ascii=False,
+                            )
+                        )
+
+        reference = self._rcpc_reference_action_count
+        for group in groups:
+            action_count = int(group[0].get("_rcpc_group_action_count", 0))
+            budget = (
+                compute_dynamic_group_budget(
+                    action_count,
+                    reference,
+                    base_budget=self.rcpc_budget,
+                    min_budget=self.rcpc_min_budget,
+                    max_budget=self.rcpc_max_budget,
+                )
+                if reference is not None
+                else 0
+            )
+            group[0]["_rcpc_group_budget"] = budget
+            group[0]["_rcpc_reference_action_count"] = reference
+
     def __call__(self, data: DataProto) -> torch.Tensor:
         call_start = time.perf_counter()
         call_metrics: Dict[str, float] = {}
@@ -650,6 +794,10 @@ class RopdIPRRewardScorer:
         groups = list(grouped.values())
         for group in groups:
             group[0]["skip_rcpc_credit"] = skip_rcpc_credit
+        self._prepare_dynamic_rcpc_budgets(
+            groups,
+            skip_rcpc_credit=skip_rcpc_credit,
+        )
         defer_rcpc_interventions = self._should_defer_rcpc_interventions(skip_rcpc_credit)
         if self.shadow_attribution_enabled:
             for group_index, group in enumerate(groups):
@@ -996,12 +1144,17 @@ class RopdIPRRewardScorer:
 
         success_count = sum(1 for status, _error in outcomes if status == "success")
         scored_empty_count = sum(1 for status, _error in outcomes if status == "empty")
+        scored_empty_errors = [
+            (str(plan["result"].get("uid", "unknown")), str(error))
+            for plan, (status, error) in zip(plans, outcomes)
+            if status == "empty" and error
+        ]
         score_errors = [
             (str(plan["result"].get("uid", "unknown")), str(error))
             for plan, (status, error) in zip(plans, outcomes)
-            if status in {"error", "empty"} and error
+            if status == "error" and error
         ]
-        all_errors = build_errors + score_errors
+        all_errors = build_errors + scored_empty_errors + score_errors
         metrics["rcpc/intervention_plan_success_count"] = float(success_count)
         metrics["rcpc/intervention_plan_scored_empty_count"] = float(scored_empty_count)
         metrics["rcpc/intervention_plan_error_count"] = float(len(all_errors))
@@ -1012,11 +1165,25 @@ class RopdIPRRewardScorer:
         metrics["rcpc/effective_group_ratio"] = (
             success_count / eligible_group_count if eligible_group_count else 0.0
         )
-        if all_errors:
-            self._handle_rcpc_plan_errors(all_errors)
+        # An empty effect map is a valid recoverable outcome: all generated
+        # pairs may have been filtered or the verifier may have returned no
+        # usable judgements after its bounded retries. ``finish_plan`` has
+        # already installed the ordinary criterion-level token advantages, so
+        # log and drop only that RCPC plan. Do not let strict debug mode turn
+        # this data-dependent condition into a full training failure.
+        if scored_empty_errors:
+            self._handle_rcpc_plan_errors(scored_empty_errors, allow_raise=False)
+        fatal_plan_errors = build_errors + score_errors
+        if fatal_plan_errors:
+            self._handle_rcpc_plan_errors(fatal_plan_errors)
         return metrics
 
-    def _handle_rcpc_plan_errors(self, errors: Sequence[Tuple[str, str]]) -> None:
+    def _handle_rcpc_plan_errors(
+        self,
+        errors: Sequence[Tuple[str, str]],
+        *,
+        allow_raise: bool = True,
+    ) -> None:
         if not errors:
             return
         error_counts: Dict[str, int] = defaultdict(int)
@@ -1024,6 +1191,7 @@ class RopdIPRRewardScorer:
             error_counts[str(error)] += 1
         summary = {
             "error_count": len(errors),
+            "action": "abort" if allow_raise and self.rcpc_fail_on_intervention_error else "drop_and_fallback",
             "error_types": [
                 {"count": count, "error": error}
                 for error, count in sorted(error_counts.items(), key=lambda item: (-item[1], item[0]))
@@ -1035,7 +1203,7 @@ class RopdIPRRewardScorer:
         }
         with self._print_lock:
             print("[ropd rcpc plan errors]", json.dumps(summary, ensure_ascii=False))
-        if self.rcpc_fail_on_intervention_error:
+        if allow_raise and self.rcpc_fail_on_intervention_error:
             raise RuntimeError(
                 "RCPC intervention failed for {} plan(s); first error: {}".format(
                     len(errors), errors[0][1]
@@ -1393,6 +1561,7 @@ class RopdIPRRewardScorer:
         try:
             candidates = self._build_rcpc_candidates_for_group(group)
             result["rcpc_candidates"] = candidates
+            result["rcpc_budget_info"] = dict(group[0].get("_rcpc_budget_info") or {})
             interventions = {}
             if self.rcpc_intervention_enabled and first.get("run_rcpc_intervention", False):
                 interventions = self._run_rcpc_interventions(first, group, result, candidates)
@@ -1419,16 +1588,42 @@ class RopdIPRRewardScorer:
         group: Sequence[Mapping[str, Any]],
     ) -> List[Dict[str, Any]]:
         if self.rcpc_derive_candidates_from_budget:
-            return build_group_candidates(
+            requested_budget = int(group[0].get("_rcpc_group_budget", self.rcpc_budget))
+            requested_budget = max(0, requested_budget)
+            candidate_pool_size = requested_budget * self.rcpc_candidate_pool_multiplier
+            precomputed_actions = group[0].get("_rcpc_precomputed_actions")
+            candidates = build_group_candidates(
                 group,
-                top_actions=self.rcpc_top_actions,
-                top_blocks=self.rcpc_top_blocks,
+                top_actions=candidate_pool_size,
+                top_blocks=candidate_pool_size,
                 min_action_chars=self.rcpc_min_action_chars,
                 max_action_chars=self.rcpc_max_action_chars,
                 max_action_tokens=self.rcpc_max_action_tokens,
                 min_robust_denom=self.rcpc_min_robust_denom,
                 min_anchor_z=self.rcpc_min_anchor_z,
+                precomputed_actions=precomputed_actions,
             )
+            candidate_count = sum(len(item.get("candidate_blocks", [])) for item in candidates)
+            effective_budget = min(requested_budget, candidate_count)
+            group[0]["_rcpc_group_budget"] = effective_budget
+            group[0]["_rcpc_budget_info"] = {
+                "dynamic": bool(self.rcpc_dynamic_budget_enabled),
+                "action_count": int(group[0].get("_rcpc_group_action_count", 0)),
+                "reference_action_count": group[0].get(
+                    "_rcpc_reference_action_count",
+                    self._rcpc_reference_action_count,
+                ),
+                "base_budget": self.rcpc_budget,
+                "min_budget": self.rcpc_min_budget,
+                "max_budget": self.rcpc_max_budget,
+                "requested_budget": requested_budget,
+                "effective_budget": effective_budget,
+                "candidate_pool_multiplier": self.rcpc_candidate_pool_multiplier,
+                "candidate_action_limit": candidate_pool_size,
+                "candidate_block_limit": candidate_pool_size,
+                "candidate_block_count": candidate_count,
+            }
+            return candidates
         return [self._build_rcpc_candidates_for_response(info) for info in group]
 
     def _build_rcpc_candidates_for_response(self, info: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1548,7 +1743,10 @@ class RopdIPRRewardScorer:
                     )
                 intervention_items.append(item)
         intervention_items.sort(key=lambda item: float(item["block"].get("selection_priority", 0.0)), reverse=True)
-        if self.rcpc_intervention_max_blocks_per_group > 0:
+        if self.rcpc_derive_candidates_from_budget:
+            group_budget = max(0, int(first.get("_rcpc_group_budget", self.rcpc_budget)))
+            intervention_items = intervention_items[:group_budget]
+        elif self.rcpc_intervention_max_blocks_per_group > 0:
             intervention_items = intervention_items[: self.rcpc_intervention_max_blocks_per_group]
         return intervention_items
 
@@ -2915,17 +3113,16 @@ class RopdIPRRewardScorer:
             if max_blocks >= 0 and emitted_blocks >= max_blocks:
                 break
 
+        budget_info = dict(result.get("rcpc_budget_info") or {})
         payload = {
             "step": step,
             "uid": first_info.get("uid", ""),
             "budget": {
-                "B_group": self.rcpc_budget,
+                **budget_info,
                 "derive_candidates_from_budget": self.rcpc_derive_candidates_from_budget,
-                "group_top_actions": self.rcpc_top_actions,
-                "group_top_blocks": self.rcpc_top_blocks,
+                "selection_rule": "block_entropy_salience_x_abs_criterion_advantage",
                 "groups_per_batch": self.rcpc_intervention_max_groups_per_batch,
                 "blocks_per_answer": self.rcpc_intervention_max_blocks_per_answer,
-                "blocks_per_group": self.rcpc_intervention_max_blocks_per_group,
                 "paired_samples_per_arm": self.rcpc_counterfactual_samples,
                 "counterfactual_batch_size": self.rcpc_counterfactual_batch_size,
                 "verifier_max_answers_per_batch": self.rcpc_verifier_batch_size,

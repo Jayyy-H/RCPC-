@@ -70,6 +70,48 @@ _KEY_CONTENT_STOPWORDS = frozenset(
         "with",
     }
 )
+
+
+def compute_dynamic_group_budget(
+    action_count: int,
+    reference_action_count: float,
+    *,
+    base_budget: int,
+    min_budget: int,
+    max_budget: int,
+    candidate_count: Optional[int] = None,
+) -> int:
+    """Scale one prompt-group intervention budget by its action density.
+
+    The rounded value is an ordinary integer throughout ``[min_budget,
+    max_budget]``; this is not a three-level schedule. ``candidate_count`` can
+    be supplied after block construction so short groups are never forced to
+    spend budget on nonexistent candidates.
+    """
+    action_count = max(0, int(action_count))
+    reference_action_count = float(reference_action_count)
+    base_budget = int(base_budget)
+    min_budget = int(min_budget)
+    max_budget = int(max_budget)
+    if reference_action_count <= 0.0:
+        raise ValueError("reference_action_count must be positive")
+    if min_budget <= 0 or max_budget < min_budget:
+        raise ValueError("dynamic budget bounds must satisfy 0 < min_budget <= max_budget")
+    if base_budget < min_budget or base_budget > max_budget:
+        raise ValueError("base_budget must lie within the dynamic budget bounds")
+    if action_count == 0:
+        return 0
+
+    # Use half-up rounding instead of Python's tie-to-even ``round`` so the
+    # mapping from action density to integer budget is easier to reason about.
+    scaled = base_budget * action_count / reference_action_count
+    requested = int(math.floor(scaled + 0.5))
+    requested = min(max_budget, max(min_budget, requested))
+    if candidate_count is not None:
+        requested = min(requested, max(0, int(candidate_count)))
+    return requested
+
+
 _FORMULA_FRAGMENT_RE = re.compile(
     r"[a-z0-9.]+(?:\s*[=+*/^<>≈≠≤≥∝]\s*[a-z0-9.]+)+",
     re.IGNORECASE,
@@ -751,6 +793,7 @@ def build_group_candidates(
     max_action_tokens: int,
     min_robust_denom: float,
     min_anchor_z: float,
+    precomputed_actions: Optional[Sequence[Sequence[Mapping[str, Any]]]] = None,
 ) -> List[Dict[str, Any]]:
     """Build one candidate pool shared by every trajectory in a prompt group.
 
@@ -758,20 +801,28 @@ def build_group_candidates(
     and block caps are applied once to the complete group. This keeps a method
     budget ``B_group`` from accidentally becoming ``B_group`` per response.
     """
+    if precomputed_actions is not None and len(precomputed_actions) != len(responses):
+        raise ValueError("precomputed_actions must match the response count")
+
     outputs: List[Dict[str, Any]] = []
     ranked_actions: List[Tuple[float, int, Mapping[str, Any]]] = []
     for response_index, response in enumerate(responses):
-        actions = score_actions(
-            str(response.get("response_text", "")),
-            response.get("response_token_offsets") or [],
-            response.get("response_token_entropies") or [],
-            min_action_chars=min_action_chars,
-            max_action_chars=max_action_chars,
-            max_action_tokens=max_action_tokens,
-            min_robust_denom=min_robust_denom,
-        )
+        if precomputed_actions is None:
+            actions = score_actions(
+                str(response.get("response_text", "")),
+                response.get("response_token_offsets") or [],
+                response.get("response_token_entropies") or [],
+                min_action_chars=min_action_chars,
+                max_action_chars=max_action_chars,
+                max_action_tokens=max_action_tokens,
+                min_robust_denom=min_robust_denom,
+            )
+        else:
+            actions = list(precomputed_actions[response_index])
         outputs.append({"actions": actions, "top_actions": [], "candidate_blocks": []})
         for action in actions:
+            if int(action.get("token_count", 0)) <= 0:
+                continue
             ranked_actions.append(
                 (float(action["uncertainty_robust_z"]), response_index, action)
             )

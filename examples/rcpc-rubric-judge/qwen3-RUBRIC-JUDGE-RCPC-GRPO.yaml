@@ -9,7 +9,7 @@ data:
   target_key: cot
   max_prompt_length: 8192
   max_response_length: 2048
-  rollout_batch_size: 32
+  rollout_batch_size: 16
   shuffle: true
   seed: 1
   max_pixels: 0
@@ -22,7 +22,7 @@ algorithm:
 
 worker:
   actor:
-    global_batch_size: 32
+    global_batch_size: 16
     micro_batch_size_per_device_for_update: 1
     micro_batch_size_per_device_for_experience: 1
     max_grad_norm: 1.0
@@ -104,12 +104,18 @@ worker:
 
     ropd_rcpc_enabled: true
     ropd_rcpc_use_token_advantage: true
-    # Canonical RCPC budget B_group. By default this single knob controls
-    # candidate discovery and the number of prefix-regeneration interventions:
-    # group_top_blocks = B_group, group_top_actions = 2 * B_group,
-    # max_intervention_blocks_per_group = B_group.
-    ropd_rcpc_budget: 32
+    # B_g = clip(round(24 * A_g / A_ref), 12, 28). A_ref is frozen from
+    # the first training batch unless explicitly supplied. Every integer from
+    # 12 through 28 is reachable; the schedule is not a three-level switch.
+    ropd_rcpc_budget: 24
     ropd_rcpc_derive_candidates_from_budget: true
+    ropd_rcpc_dynamic_budget_enabled: true
+    ropd_rcpc_min_budget: 12
+    ropd_rcpc_max_budget: 28
+    ropd_rcpc_reference_action_count: 0.0
+    # Keep 2B actions and 2B blocks locally, then execute the group-wide top B
+    # under entropy salience x absolute criterion-advantage priority.
+    ropd_rcpc_candidate_pool_multiplier: 2
     ropd_rcpc_min_action_chars: 12
     ropd_rcpc_max_action_chars: 260
     ropd_rcpc_max_action_tokens: 24
@@ -120,7 +126,7 @@ worker:
     ropd_rcpc_intervention_mode: prefix_regen
     ropd_rcpc_batch_counterfactual: true
     ropd_rcpc_overlap_generation_and_judge: true
-    ropd_rcpc_counterfactual_samples: 4
+    ropd_rcpc_counterfactual_samples: 2
     ropd_rcpc_counterfactual_batch_size: 128
     ropd_rcpc_verifier_batch_size: 12
     ropd_rcpc_verifier_max_input_tokens: 28000
@@ -128,8 +134,10 @@ worker:
     ropd_rcpc_verifier_output_tokens_per_answer: 160
     ropd_rcpc_verifier_max_retries: 2
     ropd_rcpc_effect_variance_prior: 0.1
+    # Per-group verifier/plan failures are logged and fall back to the ordinary
+    # criterion advantage instead of terminating the whole training job.
     ropd_rcpc_fail_on_intervention_error: false
-    ropd_rcpc_transport_lambda: 2.0
+    ropd_rcpc_transport_lambda: 1.0
     ropd_rcpc_fallback_to_criterion_advantage: true
     ropd_print_rcpc_outputs: false
     ropd_rcpc_print_intervention_summary: true

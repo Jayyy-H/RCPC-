@@ -15,6 +15,7 @@
 FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
+import json
 import re
 import os
 import uuid
@@ -1083,6 +1084,12 @@ class RayPPOTrainer:
         torch.save(dataloader_state_dict, dataloader_path)
         print(f"Save dataloader to {dataloader_path}")
 
+        if self.reward_fn is not None and hasattr(self.reward_fn, "state_dict"):
+            reward_state_path = os.path.join(local_global_step_folder, "reward_state.json")
+            with open(reward_state_path, "w", encoding="utf-8") as handle:
+                json.dump(self.reward_fn.state_dict(), handle, ensure_ascii=False, indent=2)
+            print(f"Save reward state to {reward_state_path}")
+
         local_latest_checkpointed_iteration = os.path.join(
             self.config.trainer.save_checkpoint_path, "latest_checkpointed_iteration.txt"
         )
@@ -1134,6 +1141,16 @@ class RayPPOTrainer:
         else:
             self.load_dataloader_state = False
             print(f"No dataloader state found at {dataloader_path}, will start from scratch.")
+
+        reward_state_path = os.path.join(self.config.trainer.load_checkpoint_path, "reward_state.json")
+        if (
+            self.reward_fn is not None
+            and hasattr(self.reward_fn, "load_state_dict")
+            and os.path.exists(reward_state_path)
+        ):
+            with open(reward_state_path, "r", encoding="utf-8") as handle:
+                self.reward_fn.load_state_dict(json.load(handle))
+            print(f"Loaded reward state from {reward_state_path}")
 
     def _limit_checkpoints_and_shards(self, role="actor"):
         """
