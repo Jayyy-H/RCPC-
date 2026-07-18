@@ -128,7 +128,7 @@ worker:
     ropd_rcpc_verifier_output_tokens_per_answer: 160
     ropd_rcpc_verifier_max_retries: 2
     ropd_rcpc_effect_variance_prior: 0.1
-    ropd_rcpc_fail_on_intervention_error: true
+    ropd_rcpc_fail_on_intervention_error: false
     ropd_rcpc_transport_lambda: 2.0
     ropd_rcpc_fallback_to_criterion_advantage: true
     ropd_print_rcpc_outputs: false
