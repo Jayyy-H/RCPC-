@@ -9,7 +9,7 @@ data:
   target_key: cot
   max_prompt_length: 8192
   max_response_length: 2048
-  rollout_batch_size: 16
+  rollout_batch_size: 32
   shuffle: true
   seed: 1
   max_pixels: 0
@@ -23,8 +23,8 @@ algorithm:
 worker:
   actor:
     global_batch_size: 16
-    micro_batch_size_per_device_for_update: 1
-    micro_batch_size_per_device_for_experience: 1
+    micro_batch_size_per_device_for_update: 2
+    micro_batch_size_per_device_for_experience: 2
     max_grad_norm: 1.0
     use_kl_loss: false
     kl_loss_coef: 0
@@ -126,7 +126,7 @@ worker:
     ropd_rcpc_intervention_mode: prefix_regen
     ropd_rcpc_batch_counterfactual: true
     ropd_rcpc_overlap_generation_and_judge: true
-    ropd_rcpc_counterfactual_samples: 2
+    ropd_rcpc_counterfactual_samples: 4
     ropd_rcpc_counterfactual_batch_size: 128
     ropd_rcpc_verifier_batch_size: 12
     ropd_rcpc_verifier_max_input_tokens: 28000
@@ -137,7 +137,7 @@ worker:
     # Per-group verifier/plan failures are logged and fall back to the ordinary
     # criterion advantage instead of terminating the whole training job.
     ropd_rcpc_fail_on_intervention_error: false
-    ropd_rcpc_transport_lambda: 1.0
+    ropd_rcpc_transport_lambda: 2.0
     ropd_rcpc_fallback_to_criterion_advantage: true
     ropd_print_rcpc_outputs: false
     ropd_rcpc_print_intervention_summary: true
@@ -164,4 +164,4 @@ trainer:
   save_ckpt_limit: 20
   save_shard_limit: 10
   val_generations_to_log_to_wandb: 10
-  max_val_batches: 1
+  max_val_batches: 3
