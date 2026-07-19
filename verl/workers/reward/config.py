@@ -69,12 +69,19 @@ class RewardConfig:
     ropd_print_shadow_attributions: bool = False
     ropd_rcpc_enabled: bool = False
     ropd_rcpc_use_token_advantage: bool = True
-    # Canonical RCPC intervention budget B_group. When
-    # ropd_rcpc_derive_candidates_from_budget is true, this single knob
-    # determines the candidate/action pool and the number of causal
-    # interventions per prompt group.
-    ropd_rcpc_budget: int = 32
+    # Base intervention budget at the frozen reference action count. Dynamic
+    # budgets are rounded to every integer in [min_budget, max_budget].
+    ropd_rcpc_budget: int = 24
     ropd_rcpc_derive_candidates_from_budget: bool = True
+    ropd_rcpc_dynamic_budget_enabled: bool = True
+    ropd_rcpc_min_budget: int = 12
+    ropd_rcpc_max_budget: int = 28
+    # <= 0 calibrates from the median prompt-group action count in the first
+    # training batch, then persists that reference in every checkpoint.
+    ropd_rcpc_reference_action_count: float = 0.0
+    # Candidate discovery is wider than the executed intervention budget so
+    # entropy x advantage priority can decide the final group allocation.
+    ropd_rcpc_candidate_pool_multiplier: int = 2
     # Advanced override knobs for ablations only. They are ignored by the
     # default budget-derived path above.
     ropd_rcpc_top_actions: int = 12
@@ -118,8 +125,8 @@ class RewardConfig:
     # Weak variance floor on one paired outcome. The estimator divides it by
     # the valid pair count, so uncertainty still decreases with more samples.
     ropd_rcpc_effect_variance_prior: float = 0.1
-    # Production RCPC runs should fail visibly instead of silently reverting to
-    # baseline token advantages when an intervention plan cannot be scored.
+    # Failed per-group plans are logged and fall back to baseline criterion
+    # advantages by default. Strict failure remains available for debugging.
     ropd_rcpc_fail_on_intervention_error: bool = False
     ropd_rcpc_transport_lambda: float = 1.0
     ropd_rcpc_fallback_to_criterion_advantage: bool = True
